@@ -22,14 +22,22 @@ mod config {
 }
 
 mod api {
-    use axum::extract::State;
+    use axum::extract::{Query, State};
     use axum::http::StatusCode;
     use axum::routing::get;
     use axum::{Json, Router};
-    use persistence_core::models::LatestMarketOverviewRecord;
-    use persistence_core::queries::{LatestMarketOverviewQuery, MarketOverviewQueryService};
+    use market_data_core::timeframe::Timeframe;
+    use persistence_core::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use persistence_core::queries::{
+        CandleHistoryQuery,
+        CandleHistoryQueryService,
+        LatestMarketOverviewQuery,
+        MarketOverviewQueryService,
+        ScenarioHistoryQuery,
+        ScenarioHistoryQueryService,
+    };
     use persistence_core::sqlite::SqliteMarketDataStore;
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
 
     use crate::config::AppConfig;
 
@@ -103,9 +111,83 @@ mod api {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+    pub struct ApiListQuery {
+        pub timeframe: Option<String>,
+        pub limit: Option<usize>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CandleResponse {
+        pub instrument_id: String,
+        pub source_id: String,
+        pub timeframe: String,
+        pub open_time_ms: i64,
+        pub close_time_ms: i64,
+        pub open: f64,
+        pub high: f64,
+        pub low: f64,
+        pub close: f64,
+        pub volume: f64,
+        pub trade_count: u64,
+        pub is_final: bool,
+    }
+
+    impl CandleResponse {
+        fn from_record(record: CandleRecord) -> Self {
+            Self {
+                instrument_id: record.candle.instrument_id,
+                source_id: record.candle.source_id,
+                timeframe: record.candle.timeframe.as_str().to_owned(),
+                open_time_ms: record.candle.open_time.0,
+                close_time_ms: record.candle.close_time.0,
+                open: record.candle.open.0,
+                high: record.candle.high.0,
+                low: record.candle.low.0,
+                close: record.candle.close.0,
+                volume: record.candle.volume.0,
+                trade_count: record.candle.trade_count,
+                is_final: record.candle.is_final,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ScenarioHistoryResponse {
+        pub instrument_id: String,
+        pub timeframe: String,
+        pub observed_at_ms: i64,
+        pub bull_probability: f64,
+        pub base_probability: f64,
+        pub bear_probability: f64,
+        pub trigger_level: f64,
+        pub invalidation_level: f64,
+        pub expected_direction: String,
+        pub explanation: String,
+    }
+
+    impl ScenarioHistoryResponse {
+        fn from_record(record: ScenarioSnapshotRecord) -> Self {
+            Self {
+                instrument_id: record.snapshot.instrument_id,
+                timeframe: record.snapshot.timeframe.as_str().to_owned(),
+                observed_at_ms: record.snapshot.observed_at.0,
+                bull_probability: record.snapshot.bull_probability,
+                base_probability: record.snapshot.base_probability,
+                bear_probability: record.snapshot.bear_probability,
+                trigger_level: record.snapshot.trigger_level,
+                invalidation_level: record.snapshot.invalidation_level,
+                expected_direction: expected_direction_as_str(record.snapshot.expected_direction).to_owned(),
+                explanation: record.snapshot.explanation,
+            }
+        }
+    }
+
     pub fn build_router(state: ApiState) -> Router {
         Router::new()
             .route("/api/market-overview", get(get_market_overview))
+            .route("/api/candles", get(get_candles))
+            .route("/api/scenario-history", get(get_scenario_history))
             .with_state(state)
     }
 
@@ -124,15 +206,11 @@ mod api {
     pub async fn get_market_overview(
         State(state): State<ApiState>,
     ) -> Result<Json<MarketOverviewResponse>, StatusCode> {
-        let store = SqliteMarketDataStore::open(&state.market_data_db_path)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        store
-            .apply_migrations()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let store = open_store(&state)?;
 
         let query = LatestMarketOverviewQuery::for_instrument(
             state.instrument_id,
-            market_data_core::timeframe::Timeframe::OneMinute,
+            Timeframe::OneMinute,
         );
         let overview = MarketOverviewQueryService
             .load_latest(&store, &query)
@@ -140,6 +218,62 @@ mod api {
             .ok_or(StatusCode::NOT_FOUND)?;
 
         Ok(Json(MarketOverviewResponse::from_record(overview)))
+    }
+
+    pub async fn get_candles(
+        State(state): State<ApiState>,
+        Query(params): Query<ApiListQuery>,
+    ) -> Result<Json<Vec<CandleResponse>>, StatusCode> {
+        let store = open_store(&state)?;
+        let timeframe = parse_timeframe(params.timeframe.as_deref())?;
+        let limit = normalize_limit(params.limit, 120);
+        let query = CandleHistoryQuery::for_instrument(state.instrument_id, timeframe, limit);
+        let candles = CandleHistoryQueryService
+            .load(&store, &query)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(candles.into_iter().map(CandleResponse::from_record).collect()))
+    }
+
+    pub async fn get_scenario_history(
+        State(state): State<ApiState>,
+        Query(params): Query<ApiListQuery>,
+    ) -> Result<Json<Vec<ScenarioHistoryResponse>>, StatusCode> {
+        let store = open_store(&state)?;
+        let timeframe = parse_timeframe(params.timeframe.as_deref())?;
+        let limit = normalize_limit(params.limit, 50);
+        let query = ScenarioHistoryQuery::for_instrument(state.instrument_id, timeframe, limit);
+        let scenarios = ScenarioHistoryQueryService
+            .load(&store, &query)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(
+            scenarios
+                .into_iter()
+                .map(ScenarioHistoryResponse::from_record)
+                .collect(),
+        ))
+    }
+
+    fn open_store(state: &ApiState) -> Result<SqliteMarketDataStore, StatusCode> {
+        let store = SqliteMarketDataStore::open(&state.market_data_db_path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .apply_migrations()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(store)
+    }
+
+    fn parse_timeframe(value: Option<&str>) -> Result<Timeframe, StatusCode> {
+        match value {
+            Some(timeframe) => timeframe.parse::<Timeframe>().map_err(|_| StatusCode::BAD_REQUEST),
+            None => Ok(Timeframe::OneMinute),
+        }
+    }
+
+    fn normalize_limit(value: Option<usize>, default_limit: usize) -> usize {
+        value.unwrap_or(default_limit).clamp(1, 1_000)
     }
 
     fn regime_label_as_str(value: scenario_core::MarketRegimeLabel) -> &'static str {
@@ -481,9 +615,11 @@ async fn main() {
 mod tests {
     use axum::extract::State;
     use super::config::AppConfig;
-    use super::api::{get_market_overview, ApiState};
+    use super::api::{get_candles, get_market_overview, get_scenario_history, ApiListQuery, ApiState};
     use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask};
+    use axum::extract::Query;
     use persistence_core::sqlite::SqliteMarketDataStore;
+    use persistence_core::repositories::ScenarioSnapshotRepository;
     use scenario_core::{ExpectedDirection, MarketRegimeLabel};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -647,6 +783,95 @@ mod tests {
         assert_eq!(response.0.last_price, 68_500.0);
         assert_eq!(response.0.regime_label, "uptrend");
         assert_eq!(response.0.expected_direction, "bullish");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn returns_recent_candles_from_api_handler() {
+        let db_path = temp_db_path("candles-handler");
+        let config = AppConfig {
+            market_data_db_path: db_path.clone(),
+            ..AppConfig::default()
+        };
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        BinanceBootstrapIngestionTask
+            .ingest_from_payloads(
+                &config,
+                &store,
+                r#"[
+                    [1710000000000,"68000.00","68500.00","67950.00","68450.12","123.45",1710000059999,"0",42,"0","0","0"],
+                    [1710000060000,"68450.12","68600.00","68400.00","68500.00","95.00",1710000119999,"0",31,"0","0","0"]
+                ]"#,
+                r#"{
+                    "symbol":"BTCUSDT",
+                    "priceChangePercent":"3.12",
+                    "lastPrice":"68500.00",
+                    "volume":"8913.3",
+                    "closeTime":1710000120000
+                }"#,
+            )
+            .expect("bootstrap ingestion should succeed");
+
+        let response = get_candles(
+            State(ApiState::from_config(&config)),
+            Query(ApiListQuery {
+                timeframe: Some("1m".to_owned()),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("api handler should return candles");
+
+        assert_eq!(response.0.len(), 2);
+        assert_eq!(response.0[0].open_time_ms, 1_710_000_000_000);
+        assert_eq!(response.0[1].close, 68_500.0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn returns_scenario_history_from_api_handler() {
+        let db_path = temp_db_path("scenario-history-handler");
+        let config = AppConfig {
+            market_data_db_path: db_path.clone(),
+            ..AppConfig::default()
+        };
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        for observed_at in [1_710_000_060_000_i64, 1_710_000_120_000_i64] {
+            let scenario_snapshot = scenario_core::ScenarioSnapshot {
+                instrument_id: "BTC-USD-SPOT".to_owned(),
+                timeframe: market_data_core::timeframe::Timeframe::OneMinute,
+                observed_at: market_data_core::value_objects::Timestamp::new(observed_at).unwrap(),
+                bull_probability: 0.55,
+                base_probability: 0.30,
+                bear_probability: 0.15,
+                trigger_level: 150.0,
+                invalidation_level: 100.0,
+                expected_direction: scenario_core::ExpectedDirection::Bullish,
+                explanation: format!("BTC scenario at {observed_at}"),
+            };
+
+            ScenarioSnapshotRepository::save(&store, &scenario_snapshot).expect("scenario snapshot should save");
+        }
+
+        let response = get_scenario_history(
+            State(ApiState::from_config(&config)),
+            Query(ApiListQuery {
+                timeframe: Some("1m".to_owned()),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("api handler should return scenario history");
+
+        assert_eq!(response.0.len(), 2);
+        assert_eq!(response.0[0].observed_at_ms, 1_710_000_060_000);
+        assert_eq!(response.0[1].expected_direction, "bullish");
 
         let _ = std::fs::remove_file(db_path);
     }

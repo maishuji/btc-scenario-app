@@ -50,7 +50,7 @@ pub mod models {
 pub mod repositories {
     use market_data_core::timeframe::Timeframe;
 
-    use super::models::LatestMarketOverviewRecord;
+    use super::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
     use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
     pub trait CandleRepository {
@@ -92,6 +92,28 @@ pub mod repositories {
             timeframe: Timeframe,
         ) -> Result<Option<LatestMarketOverviewRecord>, Self::Error>;
     }
+
+    pub trait CandleHistoryQueryRepository {
+        type Error;
+
+        fn load_candle_history(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<CandleRecord>, Self::Error>;
+    }
+
+    pub trait ScenarioHistoryQueryRepository {
+        type Error;
+
+        fn load_scenario_history(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<ScenarioSnapshotRecord>, Self::Error>;
+    }
 }
 
 pub mod sqlite {
@@ -100,13 +122,15 @@ pub mod sqlite {
 
     use rusqlite::{params, Connection, OptionalExtension};
 
-    use super::models::LatestMarketOverviewRecord;
+    use super::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
     use super::repositories::{
+        CandleHistoryQueryRepository,
         CandleRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
         MarketOverviewQueryRepository,
         RegimeSnapshotRepository,
+        ScenarioHistoryQueryRepository,
         ScenarioSnapshotRepository,
     };
     use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
@@ -375,6 +399,63 @@ pub mod sqlite {
                 },
             )
             .optional()
+        }
+
+        fn load_recent_scenario_snapshots(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<ScenarioSnapshot>, rusqlite::Error> {
+            let connection = self.connection.borrow();
+            let mut statement = connection.prepare(
+                "SELECT
+                    instrument_id,
+                    timeframe,
+                    observed_at_ms,
+                    bull_probability,
+                    base_probability,
+                    bear_probability,
+                    trigger_level,
+                    invalidation_level,
+                    expected_direction,
+                    explanation
+                 FROM scenario_snapshots
+                 WHERE instrument_id = ?1 AND timeframe = ?2
+                 ORDER BY observed_at_ms DESC
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![instrument_id, timeframe.as_str(), limit as i64],
+                |row| {
+                    let timeframe_text: String = row.get(1)?;
+                    let timeframe = timeframe_text.parse::<Timeframe>().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+                    let expected_direction = parse_expected_direction(row.get::<_, String>(8)?.as_str())?;
+
+                    Ok(ScenarioSnapshot {
+                        instrument_id: row.get(0)?,
+                        timeframe,
+                        observed_at: Timestamp::new(row.get(2)?).map_err(sqlite_mapping_error)?,
+                        bull_probability: row.get(3)?,
+                        base_probability: row.get(4)?,
+                        bear_probability: row.get(5)?,
+                        trigger_level: row.get(6)?,
+                        invalidation_level: row.get(7)?,
+                        expected_direction,
+                        explanation: row.get(9)?,
+                    })
+                },
+            )?;
+
+            let mut scenarios = rows.collect::<Result<Vec<_>, _>>()?;
+            scenarios.reverse();
+            Ok(scenarios)
         }
     }
 
@@ -689,13 +770,41 @@ pub mod sqlite {
             }))
         }
     }
+
+    impl CandleHistoryQueryRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn load_candle_history(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<CandleRecord>, Self::Error> {
+            self.load_recent_candles(instrument_id, timeframe, limit)
+                .map(|candles| candles.into_iter().map(|candle| CandleRecord { candle }).collect())
+        }
+    }
+
+    impl ScenarioHistoryQueryRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn load_scenario_history(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<ScenarioSnapshotRecord>, Self::Error> {
+            self.load_recent_scenario_snapshots(instrument_id, timeframe, limit)
+                .map(|snapshots| snapshots.into_iter().map(|snapshot| ScenarioSnapshotRecord { snapshot }).collect())
+        }
+    }
 }
 
 pub mod queries {
     use market_data_core::timeframe::Timeframe;
 
-    use super::models::LatestMarketOverviewRecord;
-    use super::repositories::MarketOverviewQueryRepository;
+    use super::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use super::repositories::{CandleHistoryQueryRepository, MarketOverviewQueryRepository, ScenarioHistoryQueryRepository};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct LatestMarketOverviewQuery {
@@ -725,6 +834,68 @@ pub mod queries {
             R: MarketOverviewQueryRepository,
         {
             repository.load_latest_market_overview(&query.instrument_id, query.timeframe)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CandleHistoryQuery {
+        pub instrument_id: String,
+        pub timeframe: Timeframe,
+        pub limit: usize,
+    }
+
+    impl CandleHistoryQuery {
+        pub fn for_instrument(instrument_id: impl Into<String>, timeframe: Timeframe, limit: usize) -> Self {
+            Self {
+                instrument_id: instrument_id.into(),
+                timeframe,
+                limit,
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct CandleHistoryQueryService;
+
+    impl CandleHistoryQueryService {
+        pub fn load<R>(self, repository: &R, query: &CandleHistoryQuery) -> Result<Vec<CandleRecord>, R::Error>
+        where
+            R: CandleHistoryQueryRepository,
+        {
+            repository.load_candle_history(&query.instrument_id, query.timeframe, query.limit)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ScenarioHistoryQuery {
+        pub instrument_id: String,
+        pub timeframe: Timeframe,
+        pub limit: usize,
+    }
+
+    impl ScenarioHistoryQuery {
+        pub fn for_instrument(instrument_id: impl Into<String>, timeframe: Timeframe, limit: usize) -> Self {
+            Self {
+                instrument_id: instrument_id.into(),
+                timeframe,
+                limit,
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct ScenarioHistoryQueryService;
+
+    impl ScenarioHistoryQueryService {
+        pub fn load<R>(
+            self,
+            repository: &R,
+            query: &ScenarioHistoryQuery,
+        ) -> Result<Vec<ScenarioSnapshotRecord>, R::Error>
+        where
+            R: ScenarioHistoryQueryRepository,
+        {
+            repository.load_scenario_history(&query.instrument_id, query.timeframe, query.limit)
         }
     }
 }
@@ -775,11 +946,13 @@ mod tests {
     };
 
     use super::repositories::{
+        CandleHistoryQueryRepository,
         CandleRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
         MarketOverviewQueryRepository,
         RegimeSnapshotRepository,
+        ScenarioHistoryQueryRepository,
         ScenarioSnapshotRepository,
     };
     use super::sqlite::SqliteMarketDataStore;
@@ -1031,5 +1204,81 @@ mod tests {
         assert_eq!(overview.feature_snapshot.trend_score, 500.0);
         assert_eq!(overview.regime_snapshot.regime_label, MarketRegimeLabel::Uptrend);
         assert_eq!(overview.scenario_snapshot.expected_direction, ExpectedDirection::Bullish);
+    }
+
+    #[test]
+    fn sqlite_store_loads_candle_history_records() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        for (open_time, close_time, close) in [
+            (1_710_000_000_000_i64, 1_710_000_059_999_i64, 68_450.12_f64),
+            (1_710_000_060_000_i64, 1_710_000_119_999_i64, 68_500.00_f64),
+            (1_710_000_120_000_i64, 1_710_000_179_999_i64, 68_650.00_f64),
+        ] {
+            let candle = Candle {
+                instrument_id: "BTC-USD-SPOT".to_owned(),
+                source_id: "binance".to_owned(),
+                timeframe: Timeframe::OneMinute,
+                open_time: Timestamp::new(open_time).unwrap(),
+                close_time: Timestamp::new(close_time).unwrap(),
+                open: Price::new(68_000.0).unwrap(),
+                high: Price::new(68_700.0).unwrap(),
+                low: Price::new(67_950.0).unwrap(),
+                close: Price::new(close).unwrap(),
+                volume: Volume::new(123.45).unwrap(),
+                trade_count: 42,
+                is_final: true,
+            };
+
+            CandleRepository::save(&store, &candle).expect("candle should save");
+        }
+
+        let candles = CandleHistoryQueryRepository::load_candle_history(
+            &store,
+            "BTC-USD-SPOT",
+            Timeframe::OneMinute,
+            2,
+        )
+        .expect("candle history should load");
+
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].candle.open_time.0, 1_710_000_060_000);
+        assert_eq!(candles[1].candle.open_time.0, 1_710_000_120_000);
+    }
+
+    #[test]
+    fn sqlite_store_loads_scenario_history_records() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        for observed_at in [1_710_000_060_000_i64, 1_710_000_120_000_i64, 1_710_000_180_000_i64] {
+            let scenario_snapshot = ScenarioSnapshot {
+                instrument_id: "BTC-USD-SPOT".to_owned(),
+                timeframe: Timeframe::OneMinute,
+                observed_at: Timestamp::new(observed_at).unwrap(),
+                bull_probability: 0.55,
+                base_probability: 0.30,
+                bear_probability: 0.15,
+                trigger_level: 150.0,
+                invalidation_level: 100.0,
+                expected_direction: ExpectedDirection::Bullish,
+                explanation: format!("BTC scenario at {observed_at}"),
+            };
+
+            ScenarioSnapshotRepository::save(&store, &scenario_snapshot).expect("scenario snapshot should save");
+        }
+
+        let scenarios = ScenarioHistoryQueryRepository::load_scenario_history(
+            &store,
+            "BTC-USD-SPOT",
+            Timeframe::OneMinute,
+            2,
+        )
+        .expect("scenario history should load");
+
+        assert_eq!(scenarios.len(), 2);
+        assert_eq!(scenarios[0].snapshot.observed_at.0, 1_710_000_120_000);
+        assert_eq!(scenarios[1].snapshot.observed_at.0, 1_710_000_180_000);
     }
 }
