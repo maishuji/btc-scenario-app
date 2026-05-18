@@ -3,9 +3,13 @@ use market_data_core::instrument::Instrument;
 use market_data_core::snapshot::LivePriceSnapshot;
 use market_data_core::timeframe::Timeframe;
 use market_data_core::value_objects::{Price, Timestamp, Volume};
+use reqwest::blocking::Client as BlockingHttpClient;
 use serde_json::Value;
 
 pub mod clients {
+    use super::BlockingHttpClient;
+    use serde_json::json;
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RestRequest {
         pub path: &'static str,
@@ -22,6 +26,12 @@ pub mod clients {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RestResponse {
+        pub status_code: u16,
+        pub body: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RestMarketDataClient {
         pub base_url: String,
     }
@@ -31,6 +41,38 @@ pub mod clients {
             Self {
                 base_url: base_url.into(),
             }
+        }
+
+        pub fn build_url(&self, request: &RestRequest) -> String {
+            let base = format!("{}{}", self.base_url.trim_end_matches('/'), request.path);
+            if request.query.is_empty() {
+                return base;
+            }
+
+            let query = request
+                .query
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("&");
+
+            format!("{base}?{query}")
+        }
+
+        pub fn execute_text(&self, request: &RestRequest) -> Result<RestResponse, String> {
+            let url = self.build_url(request);
+            let response = BlockingHttpClient::new()
+                .get(url)
+                .send()
+                .map_err(|error| error.to_string())?;
+            let status_code = response.status().as_u16();
+            let body = response.text().map_err(|error| error.to_string())?;
+
+            if status_code >= 400 {
+                return Err(format!("http request failed with status {status_code}: {body}"));
+            }
+
+            Ok(RestResponse { status_code, body })
         }
     }
 
@@ -49,6 +91,45 @@ pub mod clients {
             Self {
                 base_url: base_url.into(),
             }
+        }
+
+        pub fn build_combined_stream_url(&self, subscriptions: &[StreamSubscription]) -> Result<String, String> {
+            if subscriptions.is_empty() {
+                return Err("at least one websocket stream subscription is required".to_owned());
+            }
+
+            let streams = subscriptions
+                .iter()
+                .map(|subscription| subscription.stream_name.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
+
+            Ok(format!(
+                "{}/stream?streams={streams}",
+                self.base_url.trim_end_matches('/')
+            ))
+        }
+
+        pub fn build_subscribe_message(
+            &self,
+            subscriptions: &[StreamSubscription],
+            request_id: u64,
+        ) -> Result<String, String> {
+            if subscriptions.is_empty() {
+                return Err("at least one websocket stream subscription is required".to_owned());
+            }
+
+            let params = subscriptions
+                .iter()
+                .map(|subscription| subscription.stream_name.clone())
+                .collect::<Vec<_>>();
+            let payload = json!({
+                "method": "SUBSCRIBE",
+                "params": params,
+                "id": request_id,
+            });
+
+            Ok(payload.to_string())
         }
     }
 }
@@ -192,6 +273,23 @@ pub mod adapters {
                 trade_count: parse_array_i64(record, 8)? as u64,
                 is_final: true,
             })
+        }
+
+        pub fn parse_klines_response(
+            self,
+            instrument: &Instrument,
+            timeframe: Timeframe,
+            payload: &str,
+        ) -> Result<Vec<Candle>, String> {
+            let document = parse_json(payload)?;
+            let records = document
+                .as_array()
+                .ok_or_else(|| "expected kline response array".to_owned())?;
+
+            records
+                .iter()
+                .map(|record| self.parse_kline_record(instrument, timeframe, record))
+                .collect()
         }
     }
 
@@ -345,6 +443,7 @@ fn parse_array_i64(value: &Value, index: usize) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::adapters::BinanceMarketDataAdapter;
+    use super::clients::{StreamSubscription, WebSocketMarketDataClient};
     use super::health::{SourceHealthMonitor, SourceStatus};
     use super::normalization::SymbolMapper;
     use market_data_core::instrument::Instrument;
@@ -367,6 +466,7 @@ mod tests {
     #[test]
     fn builds_required_binance_rest_requests() {
         let adapter = BinanceMarketDataAdapter;
+        let rest_client = adapter.rest_client();
         let request = adapter.build_klines_request("BTCUSDT", Timeframe::OneMinute, 1000, None, None);
         let latest_price_request = adapter.build_latest_price_request("BTCUSDT");
         let market_summary_request = adapter.build_market_summary_request("BTCUSDT");
@@ -375,6 +475,10 @@ mod tests {
         assert_eq!(request.query_value("symbol"), Some("BTCUSDT"));
         assert_eq!(request.query_value("interval"), Some("1m"));
         assert_eq!(request.query_value("limit"), Some("1000"));
+        assert_eq!(
+            rest_client.build_url(&request),
+            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1000"
+        );
         assert_eq!(latest_price_request.path, "/api/v3/ticker/price");
         assert_eq!(market_summary_request.path, "/api/v3/ticker/24hr");
     }
@@ -383,10 +487,40 @@ mod tests {
     fn builds_required_binance_stream_subscriptions() {
         let adapter = BinanceMarketDataAdapter;
         let subscriptions = adapter.build_primary_stream_subscriptions("BTCUSDT");
+        let websocket_client = adapter.websocket_client();
 
         assert_eq!(subscriptions.len(), 2);
         assert_eq!(subscriptions[0].stream_name, "btcusdt@kline_1m");
         assert_eq!(subscriptions[1].stream_name, "btcusdt@miniTicker");
+        assert_eq!(
+            websocket_client
+                .build_combined_stream_url(&subscriptions)
+                .expect("combined stream url should build"),
+            "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/btcusdt@miniTicker"
+        );
+    }
+
+    #[test]
+    fn builds_subscribe_message_for_streams() {
+        let websocket_client = WebSocketMarketDataClient::new("wss://stream.binance.com:9443");
+        let message = websocket_client
+            .build_subscribe_message(
+                &[
+                    StreamSubscription {
+                        stream_name: "btcusdt@kline_1m".to_owned(),
+                    },
+                    StreamSubscription {
+                        stream_name: "btcusdt@miniTicker".to_owned(),
+                    },
+                ],
+                7,
+            )
+            .expect("subscribe message should build");
+
+        assert_eq!(
+            message,
+            r#"{"id":7,"method":"SUBSCRIBE","params":["btcusdt@kline_1m","btcusdt@miniTicker"]}"#
+        );
     }
 
     #[test]
@@ -448,6 +582,25 @@ mod tests {
         assert_eq!(candle.close.0, 68_450.12);
         assert_eq!(candle.trade_count, 42);
         assert!(candle.is_final);
+    }
+
+    #[test]
+    fn parses_klines_response_into_candles() {
+        let adapter = BinanceMarketDataAdapter;
+        let candles = adapter
+            .parse_klines_response(
+                &Instrument::btc_usd_spot(),
+                Timeframe::OneMinute,
+                r#"[
+                    [1710000000000,"68000.00","68500.00","67950.00","68450.12","123.45",1710000059999,"0",42,"0","0","0"],
+                    [1710000060000,"68450.12","68600.00","68400.00","68500.00","95.00",1710000119999,"0",31,"0","0","0"]
+                ]"#,
+            )
+            .expect("kline response should parse");
+
+        assert_eq!(candles.len(), 2);
+        assert_eq!(candles[0].open.0, 68_000.0);
+        assert_eq!(candles[1].close.0, 68_500.0);
     }
 
     #[test]
