@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/market-intelligence-app",
+    "crates/market-data-core",
+    "crates/market-data-infrastructure",
+    "crates/scenario-core",
+    "crates/persistence-core",
+]
+resolver = "2"

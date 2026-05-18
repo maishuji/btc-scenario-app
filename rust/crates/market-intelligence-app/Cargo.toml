@@ -1,0 +1,11 @@
+[package]
+name = "market-intelligence-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+market-data-core = { path = "../market-data-core" }
+market-data-infrastructure = { path = "../market-data-infrastructure" }
+persistence-core = { path = "../persistence-core" }
+scenario-core = { path = "../scenario-core" }
+
