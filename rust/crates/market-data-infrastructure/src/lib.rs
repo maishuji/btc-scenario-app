@@ -262,6 +262,7 @@ pub mod adapters {
         ) -> Result<Candle, String> {
             Ok(Candle {
                 instrument_id: instrument.id.clone(),
+                source_id: "binance".to_owned(),
                 timeframe,
                 open_time: Timestamp::new(parse_array_i64(record, 0)?).map_err(str::to_owned)?,
                 open: Price::new(parse_array_f64(record, 1)?).map_err(str::to_owned)?,
@@ -577,6 +578,7 @@ mod tests {
             .expect("kline record should parse");
 
         assert_eq!(candle.instrument_id, "BTC-USD-SPOT");
+        assert_eq!(candle.source_id, "binance");
         assert_eq!(candle.timeframe, Timeframe::OneMinute);
         assert_eq!(candle.open.0, 68_000.0);
         assert_eq!(candle.close.0, 68_450.12);

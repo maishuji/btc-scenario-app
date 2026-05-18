@@ -327,6 +327,7 @@ mod tests {
     fn build_candle(open: f64, high: f64, low: f64, close: f64, close_time: i64) -> Candle {
         Candle {
             instrument_id: "BTC-USD-SPOT".to_owned(),
+            source_id: "binance".to_owned(),
             timeframe: Timeframe::OneMinute,
             open_time: Timestamp::new(close_time - 60_000).unwrap(),
             close_time: Timestamp::new(close_time).unwrap(),

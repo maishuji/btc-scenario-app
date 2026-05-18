@@ -6,7 +6,5 @@ edition = "2024"
 [dependencies]
 market-data-core = { path = "../market-data-core" }
 scenario-core = { path = "../scenario-core" }
-
-[dev-dependencies]
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 

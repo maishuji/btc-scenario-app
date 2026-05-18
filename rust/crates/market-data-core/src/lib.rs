@@ -180,6 +180,7 @@ pub mod candle {
     #[derive(Debug, Clone, PartialEq)]
     pub struct Candle {
         pub instrument_id: String,
+        pub source_id: String,
         pub timeframe: Timeframe,
         pub open_time: Timestamp,
         pub close_time: Timestamp,
