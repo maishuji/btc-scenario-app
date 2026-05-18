@@ -28,8 +28,20 @@ mod tasks {
     use market_data_infrastructure::adapters::BinanceMarketDataAdapter;
     use market_data_infrastructure::adapters::BinanceStreamEvent;
     use market_data_core::timeframe::Timeframe;
-    use persistence_core::repositories::{CandleRepository, LivePriceSnapshotRepository};
+    use persistence_core::repositories::{
+        CandleRepository,
+        FeatureSnapshotRepository,
+        LivePriceSnapshotRepository,
+        RegimeSnapshotRepository,
+        ScenarioSnapshotRepository,
+    };
     use persistence_core::sqlite::SqliteMarketDataStore;
+    use scenario_core::{
+        FeatureSnapshotBuilder,
+        MarketRegimeStrategy,
+        ScenarioExplanationBuilder,
+        ScenarioSnapshotFactory,
+    };
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct BinanceBootstrapIngestionTask;
@@ -39,6 +51,7 @@ mod tasks {
         pub persisted_candle_count: usize,
         pub snapshot_observed_at_ms: i64,
         pub websocket_stream_url: String,
+        pub persisted_analytics_count: usize,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +59,31 @@ mod tasks {
         pub processed_message_count: usize,
         pub persisted_candle_update_count: usize,
         pub persisted_snapshot_update_count: usize,
+        pub persisted_analytics_count: usize,
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct AnalyticsSnapshotPipeline;
+
+    impl AnalyticsSnapshotPipeline {
+        pub fn compute_and_persist(
+            self,
+            store: &SqliteMarketDataStore,
+            candles: &[market_data_core::candle::Candle],
+        ) -> Result<usize, String> {
+            let feature_snapshot = FeatureSnapshotBuilder
+                .build(candles)
+                .ok_or_else(|| "at least one candle is required to build analytics snapshots".to_owned())?;
+            let regime_snapshot = MarketRegimeStrategy.classify(&feature_snapshot);
+            let explanation = ScenarioExplanationBuilder.build(&feature_snapshot, &regime_snapshot);
+            let scenario_snapshot = ScenarioSnapshotFactory.build(&feature_snapshot, &regime_snapshot, explanation);
+
+            FeatureSnapshotRepository::save(store, &feature_snapshot).map_err(|error| error.to_string())?;
+            RegimeSnapshotRepository::save(store, &regime_snapshot).map_err(|error| error.to_string())?;
+            ScenarioSnapshotRepository::save(store, &scenario_snapshot).map_err(|error| error.to_string())?;
+
+            Ok(3)
+        }
     }
 
     impl BinanceBootstrapIngestionTask {
@@ -74,11 +112,14 @@ mod tasks {
             }
 
             LivePriceSnapshotRepository::save(store, &snapshot).map_err(|error| error.to_string())?;
+            let persisted_analytics_count = AnalyticsSnapshotPipeline
+                .compute_and_persist(store, &candles)?;
 
             Ok(IngestionSummary {
                 persisted_candle_count: candles.len(),
                 snapshot_observed_at_ms: snapshot.observed_at.0,
                 websocket_stream_url,
+                persisted_analytics_count,
             })
         }
 
@@ -114,12 +155,14 @@ mod tasks {
             let adapter = BinanceMarketDataAdapter;
             let mut persisted_candle_update_count = 0;
             let mut persisted_snapshot_update_count = 0;
+            let mut latest_candles = Vec::new();
 
             for payload in payloads {
                 match adapter.parse_combined_stream_payload(&instrument, payload)? {
                     BinanceStreamEvent::Kline(candle) => {
                         CandleRepository::save(store, &candle).map_err(|error| error.to_string())?;
                         persisted_candle_update_count += 1;
+                        latest_candles.push(candle);
                     }
                     BinanceStreamEvent::MiniTicker(snapshot) => {
                         LivePriceSnapshotRepository::save(store, &snapshot)
@@ -130,11 +173,20 @@ mod tasks {
             }
 
             let _ = config;
+            let persisted_analytics_count = if latest_candles.is_empty() {
+                0
+            } else {
+                let candles = store
+                    .load_recent_candles(&instrument.id, Timeframe::OneMinute, 120)
+                    .map_err(|error| error.to_string())?;
+                AnalyticsSnapshotPipeline.compute_and_persist(store, &candles)?
+            };
 
             Ok(LiveSyncSummary {
                 processed_message_count: payloads.len(),
                 persisted_candle_update_count,
                 persisted_snapshot_update_count,
+                persisted_analytics_count,
             })
         }
 
@@ -266,12 +318,16 @@ mod tests {
 
         assert_eq!(summary.persisted_candle_count, 2);
         assert_eq!(summary.snapshot_observed_at_ms, 1_710_000_120_000);
+        assert_eq!(summary.persisted_analytics_count, 3);
         assert_eq!(
             summary.websocket_stream_url,
             "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/btcusdt@miniTicker"
         );
         assert_eq!(store.count_rows("candles").unwrap(), 2);
         assert_eq!(store.count_rows("live_price_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
     }
 
     #[test]
@@ -327,7 +383,11 @@ mod tests {
         assert_eq!(summary.processed_message_count, 2);
         assert_eq!(summary.persisted_candle_update_count, 1);
         assert_eq!(summary.persisted_snapshot_update_count, 1);
+        assert_eq!(summary.persisted_analytics_count, 3);
         assert_eq!(store.count_rows("candles").unwrap(), 1);
         assert_eq!(store.count_rows("live_price_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
     }
 }
