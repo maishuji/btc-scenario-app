@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 market-data-core = { path = "../market-data-core" }
+serde_json = "1.0"
 
