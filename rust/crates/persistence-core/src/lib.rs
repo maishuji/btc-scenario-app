@@ -30,6 +30,14 @@ pub mod models {
         pub snapshot: ScenarioSnapshot,
     }
 
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct LatestMarketOverviewRecord {
+        pub live_price_snapshot: LivePriceSnapshot,
+        pub feature_snapshot: FeatureSnapshot,
+        pub regime_snapshot: MarketRegimeSnapshot,
+        pub scenario_snapshot: ScenarioSnapshot,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct AlertRecord {
         pub instrument_id: String,
@@ -40,6 +48,9 @@ pub mod models {
 }
 
 pub mod repositories {
+    use market_data_core::timeframe::Timeframe;
+
+    use super::models::LatestMarketOverviewRecord;
     use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
     pub trait CandleRepository {
@@ -71,18 +82,30 @@ pub mod repositories {
 
         fn save(&self, snapshot: &ScenarioSnapshot) -> Result<(), Self::Error>;
     }
+
+    pub trait MarketOverviewQueryRepository {
+        type Error;
+
+        fn load_latest_market_overview(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+        ) -> Result<Option<LatestMarketOverviewRecord>, Self::Error>;
+    }
 }
 
 pub mod sqlite {
     use std::cell::RefCell;
     use std::path::Path;
 
-    use rusqlite::{params, Connection};
+    use rusqlite::{params, Connection, OptionalExtension};
 
+    use super::models::LatestMarketOverviewRecord;
     use super::repositories::{
         CandleRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
+        MarketOverviewQueryRepository,
         RegimeSnapshotRepository,
         ScenarioSnapshotRepository,
     };
@@ -183,6 +206,176 @@ pub mod sqlite {
             candles.reverse();
             Ok(candles)
         }
+
+        fn load_latest_live_price_snapshot(
+            &self,
+            instrument_id: &str,
+        ) -> Result<Option<LivePriceSnapshot>, rusqlite::Error> {
+            self.connection.borrow().query_row(
+                "SELECT
+                    instrument_id,
+                    source_id,
+                    last_price,
+                    price_change_24h,
+                    volume_24h,
+                    observed_at_ms
+                 FROM live_price_snapshots
+                 WHERE instrument_id = ?1
+                 ORDER BY observed_at_ms DESC
+                 LIMIT 1",
+                params![instrument_id],
+                |row| {
+                    Ok(LivePriceSnapshot {
+                        instrument_id: row.get(0)?,
+                        source_id: row.get(1)?,
+                        last_price: Price::new(row.get(2)?).map_err(sqlite_mapping_error)?,
+                        price_change_24h: row.get(3)?,
+                        volume_24h: Volume::new(row.get(4)?).map_err(sqlite_mapping_error)?,
+                        observed_at: Timestamp::new(row.get(5)?).map_err(sqlite_mapping_error)?,
+                    })
+                },
+            )
+            .optional()
+        }
+
+        fn load_feature_snapshot_at(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            observed_at_ms: i64,
+        ) -> Result<Option<FeatureSnapshot>, rusqlite::Error> {
+            self.connection.borrow().query_row(
+                "SELECT
+                    instrument_id,
+                    timeframe,
+                    observed_at_ms,
+                    trend_score,
+                    momentum_score,
+                    volatility_score,
+                    volume_confirmation_score,
+                    support_distance,
+                    resistance_distance,
+                    level_reaction_score
+                 FROM feature_snapshots
+                 WHERE instrument_id = ?1 AND timeframe = ?2 AND observed_at_ms = ?3
+                 LIMIT 1",
+                params![instrument_id, timeframe.as_str(), observed_at_ms],
+                |row| {
+                    let timeframe_text: String = row.get(1)?;
+                    let timeframe = timeframe_text.parse::<Timeframe>().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+
+                    Ok(FeatureSnapshot {
+                        instrument_id: row.get(0)?,
+                        timeframe,
+                        observed_at: Timestamp::new(row.get(2)?).map_err(sqlite_mapping_error)?,
+                        trend_score: row.get(3)?,
+                        momentum_score: row.get(4)?,
+                        volatility_score: row.get(5)?,
+                        volume_confirmation_score: row.get(6)?,
+                        support_distance: row.get(7)?,
+                        resistance_distance: row.get(8)?,
+                        level_reaction_score: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+        }
+
+        fn load_regime_snapshot_at(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            observed_at_ms: i64,
+        ) -> Result<Option<MarketRegimeSnapshot>, rusqlite::Error> {
+            self.connection.borrow().query_row(
+                "SELECT
+                    instrument_id,
+                    timeframe,
+                    observed_at_ms,
+                    regime_label,
+                    regime_score
+                 FROM regime_snapshots
+                 WHERE instrument_id = ?1 AND timeframe = ?2 AND observed_at_ms = ?3
+                 LIMIT 1",
+                params![instrument_id, timeframe.as_str(), observed_at_ms],
+                |row| {
+                    let timeframe_text: String = row.get(1)?;
+                    let timeframe = timeframe_text.parse::<Timeframe>().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+                    let regime_label = parse_regime_label(row.get::<_, String>(3)?.as_str())?;
+
+                    Ok(MarketRegimeSnapshot {
+                        instrument_id: row.get(0)?,
+                        timeframe,
+                        observed_at: Timestamp::new(row.get(2)?).map_err(sqlite_mapping_error)?,
+                        regime_label,
+                        regime_score: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        }
+
+        fn load_latest_scenario_snapshot(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+        ) -> Result<Option<ScenarioSnapshot>, rusqlite::Error> {
+            self.connection.borrow().query_row(
+                "SELECT
+                    instrument_id,
+                    timeframe,
+                    observed_at_ms,
+                    bull_probability,
+                    base_probability,
+                    bear_probability,
+                    trigger_level,
+                    invalidation_level,
+                    expected_direction,
+                    explanation
+                 FROM scenario_snapshots
+                 WHERE instrument_id = ?1 AND timeframe = ?2
+                 ORDER BY observed_at_ms DESC
+                 LIMIT 1",
+                params![instrument_id, timeframe.as_str()],
+                |row| {
+                    let timeframe_text: String = row.get(1)?;
+                    let timeframe = timeframe_text.parse::<Timeframe>().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+                    let expected_direction = parse_expected_direction(row.get::<_, String>(8)?.as_str())?;
+
+                    Ok(ScenarioSnapshot {
+                        instrument_id: row.get(0)?,
+                        timeframe,
+                        observed_at: Timestamp::new(row.get(2)?).map_err(sqlite_mapping_error)?,
+                        bull_probability: row.get(3)?,
+                        base_probability: row.get(4)?,
+                        bear_probability: row.get(5)?,
+                        trigger_level: row.get(6)?,
+                        invalidation_level: row.get(7)?,
+                        expected_direction,
+                        explanation: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+        }
     }
 
     fn sqlite_mapping_error(message: &'static str) -> rusqlite::Error {
@@ -202,12 +395,42 @@ pub mod sqlite {
         }
     }
 
+    fn parse_regime_label(value: &str) -> Result<MarketRegimeLabel, rusqlite::Error> {
+        match value {
+            "uptrend" => Ok(MarketRegimeLabel::Uptrend),
+            "downtrend" => Ok(MarketRegimeLabel::Downtrend),
+            "range" => Ok(MarketRegimeLabel::Range),
+            "high_volatility_transition" => Ok(MarketRegimeLabel::HighVolatilityTransition),
+            _ => Err(sqlite_text_mapping_error(value)),
+        }
+    }
+
     fn expected_direction_as_str(value: ExpectedDirection) -> &'static str {
         match value {
             ExpectedDirection::Bullish => "bullish",
             ExpectedDirection::Neutral => "neutral",
             ExpectedDirection::Bearish => "bearish",
         }
+    }
+
+    fn parse_expected_direction(value: &str) -> Result<ExpectedDirection, rusqlite::Error> {
+        match value {
+            "bullish" => Ok(ExpectedDirection::Bullish),
+            "neutral" => Ok(ExpectedDirection::Neutral),
+            "bearish" => Ok(ExpectedDirection::Bearish),
+            _ => Err(sqlite_text_mapping_error(value)),
+        }
+    }
+
+    fn sqlite_text_mapping_error(value: &str) -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported SQLite text enum value: {value}"),
+            )),
+        )
     }
 
     impl CandleRepository for SqliteMarketDataStore {
@@ -428,21 +651,80 @@ pub mod sqlite {
             Ok(())
         }
     }
+
+    impl MarketOverviewQueryRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn load_latest_market_overview(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+        ) -> Result<Option<LatestMarketOverviewRecord>, Self::Error> {
+            let Some(scenario_snapshot) = self.load_latest_scenario_snapshot(instrument_id, timeframe)? else {
+                return Ok(None);
+            };
+            let Some(feature_snapshot) = self.load_feature_snapshot_at(
+                instrument_id,
+                timeframe,
+                scenario_snapshot.observed_at.0,
+            )? else {
+                return Ok(None);
+            };
+            let Some(regime_snapshot) = self.load_regime_snapshot_at(
+                instrument_id,
+                timeframe,
+                scenario_snapshot.observed_at.0,
+            )? else {
+                return Ok(None);
+            };
+            let Some(live_price_snapshot) = self.load_latest_live_price_snapshot(instrument_id)? else {
+                return Ok(None);
+            };
+
+            Ok(Some(LatestMarketOverviewRecord {
+                live_price_snapshot,
+                feature_snapshot,
+                regime_snapshot,
+                scenario_snapshot,
+            }))
+        }
+    }
 }
 
 pub mod queries {
+    use market_data_core::timeframe::Timeframe;
+
+    use super::models::LatestMarketOverviewRecord;
+    use super::repositories::MarketOverviewQueryRepository;
+
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct LatestSnapshotQueries {
+    pub struct LatestMarketOverviewQuery {
         pub instrument_id: String,
-        pub timeframe: String,
+        pub timeframe: Timeframe,
     }
 
-    impl LatestSnapshotQueries {
-        pub fn latest_scenario_for(instrument_id: impl Into<String>, timeframe: impl Into<String>) -> Self {
+    impl LatestMarketOverviewQuery {
+        pub fn for_instrument(instrument_id: impl Into<String>, timeframe: Timeframe) -> Self {
             Self {
                 instrument_id: instrument_id.into(),
-                timeframe: timeframe.into(),
+                timeframe,
             }
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct MarketOverviewQueryService;
+
+    impl MarketOverviewQueryService {
+        pub fn load_latest<R>(
+            self,
+            repository: &R,
+            query: &LatestMarketOverviewQuery,
+        ) -> Result<Option<LatestMarketOverviewRecord>, R::Error>
+        where
+            R: MarketOverviewQueryRepository,
+        {
+            repository.load_latest_market_overview(&query.instrument_id, query.timeframe)
         }
     }
 }
@@ -496,6 +778,7 @@ mod tests {
         CandleRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
+        MarketOverviewQueryRepository,
         RegimeSnapshotRepository,
         ScenarioSnapshotRepository,
     };
@@ -684,5 +967,69 @@ mod tests {
         assert_eq!(candles.len(), 2);
         assert!(candles[0].open_time.0 < candles[1].open_time.0);
         assert_eq!(candles[1].close.0, 68_500.0);
+    }
+
+    #[test]
+    fn sqlite_store_loads_latest_market_overview() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let live_snapshot = LivePriceSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            source_id: "binance".to_owned(),
+            last_price: Price::new(68_550.0).unwrap(),
+            price_change_24h: 2.5,
+            volume_24h: Volume::new(8_900.0).unwrap(),
+            observed_at: Timestamp::new(1_710_000_180_000).unwrap(),
+        };
+        let feature_snapshot = FeatureSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            timeframe: Timeframe::OneMinute,
+            observed_at: Timestamp::new(1_710_000_120_000).unwrap(),
+            trend_score: 500.0,
+            momentum_score: 50.0,
+            volatility_score: 200.0,
+            volume_confirmation_score: 25.0,
+            support_distance: 100.0,
+            resistance_distance: 150.0,
+            level_reaction_score: 250.0,
+        };
+        let regime_snapshot = MarketRegimeSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            timeframe: Timeframe::OneMinute,
+            observed_at: Timestamp::new(1_710_000_120_000).unwrap(),
+            regime_label: MarketRegimeLabel::Uptrend,
+            regime_score: 700.0,
+        };
+        let scenario_snapshot = ScenarioSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            timeframe: Timeframe::OneMinute,
+            observed_at: Timestamp::new(1_710_000_120_000).unwrap(),
+            bull_probability: 0.55,
+            base_probability: 0.30,
+            bear_probability: 0.15,
+            trigger_level: 150.0,
+            invalidation_level: 100.0,
+            expected_direction: ExpectedDirection::Bullish,
+            explanation: "BTC is in an uptrend.".to_owned(),
+        };
+
+        LivePriceSnapshotRepository::save(&store, &live_snapshot).expect("live snapshot should save");
+        FeatureSnapshotRepository::save(&store, &feature_snapshot).expect("feature snapshot should save");
+        RegimeSnapshotRepository::save(&store, &regime_snapshot).expect("regime snapshot should save");
+        ScenarioSnapshotRepository::save(&store, &scenario_snapshot).expect("scenario snapshot should save");
+
+        let overview = MarketOverviewQueryRepository::load_latest_market_overview(
+            &store,
+            "BTC-USD-SPOT",
+            Timeframe::OneMinute,
+        )
+        .expect("latest market overview query should succeed")
+        .expect("latest market overview should exist");
+
+        assert_eq!(overview.live_price_snapshot.last_price.0, 68_550.0);
+        assert_eq!(overview.feature_snapshot.trend_score, 500.0);
+        assert_eq!(overview.regime_snapshot.regime_label, MarketRegimeLabel::Uptrend);
+        assert_eq!(overview.scenario_snapshot.expected_direction, ExpectedDirection::Bullish);
     }
 }

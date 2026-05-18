@@ -28,6 +28,8 @@ mod tasks {
     use market_data_infrastructure::adapters::BinanceMarketDataAdapter;
     use market_data_infrastructure::adapters::BinanceStreamEvent;
     use market_data_core::timeframe::Timeframe;
+    use persistence_core::models::LatestMarketOverviewRecord;
+    use persistence_core::queries::{LatestMarketOverviewQuery, MarketOverviewQueryService};
     use persistence_core::repositories::{
         CandleRepository,
         FeatureSnapshotRepository,
@@ -52,14 +54,16 @@ mod tasks {
         pub snapshot_observed_at_ms: i64,
         pub websocket_stream_url: String,
         pub persisted_analytics_count: usize,
+        pub latest_market_overview: Option<LatestMarketOverviewRecord>,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq)]
     pub struct LiveSyncSummary {
         pub processed_message_count: usize,
         pub persisted_candle_update_count: usize,
         pub persisted_snapshot_update_count: usize,
         pub persisted_analytics_count: usize,
+        pub latest_market_overview: Option<LatestMarketOverviewRecord>,
     }
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -83,6 +87,24 @@ mod tasks {
             ScenarioSnapshotRepository::save(store, &scenario_snapshot).map_err(|error| error.to_string())?;
 
             Ok(3)
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct MarketOverviewReadTask;
+
+    impl MarketOverviewReadTask {
+        pub fn load_latest(
+            self,
+            store: &SqliteMarketDataStore,
+            instrument: &Instrument,
+            timeframe: Timeframe,
+        ) -> Result<Option<LatestMarketOverviewRecord>, String> {
+            let query = LatestMarketOverviewQuery::for_instrument(instrument.id.clone(), timeframe);
+
+            MarketOverviewQueryService
+                .load_latest(store, &query)
+                .map_err(|error| error.to_string())
         }
     }
 
@@ -114,12 +136,15 @@ mod tasks {
             LivePriceSnapshotRepository::save(store, &snapshot).map_err(|error| error.to_string())?;
             let persisted_analytics_count = AnalyticsSnapshotPipeline
                 .compute_and_persist(store, &candles)?;
+            let latest_market_overview = MarketOverviewReadTask
+                .load_latest(store, &instrument, Timeframe::OneMinute)?;
 
             Ok(IngestionSummary {
                 persisted_candle_count: candles.len(),
                 snapshot_observed_at_ms: snapshot.observed_at.0,
                 websocket_stream_url,
                 persisted_analytics_count,
+                latest_market_overview,
             })
         }
 
@@ -181,12 +206,15 @@ mod tasks {
                     .map_err(|error| error.to_string())?;
                 AnalyticsSnapshotPipeline.compute_and_persist(store, &candles)?
             };
+            let latest_market_overview = MarketOverviewReadTask
+                .load_latest(store, &instrument, Timeframe::OneMinute)?;
 
             Ok(LiveSyncSummary {
                 processed_message_count: payloads.len(),
                 persisted_candle_update_count,
                 persisted_snapshot_update_count,
                 persisted_analytics_count,
+                latest_market_overview,
             })
         }
 
@@ -271,13 +299,26 @@ fn main() {
 
     match runtime.run() {
         Ok(summary) => {
-            println!(
-                "persisted {} candles, latest snapshot at {}, live streams {}, processed {} live messages",
-                summary.bootstrap.persisted_candle_count,
-                summary.bootstrap.snapshot_observed_at_ms,
-                summary.bootstrap.websocket_stream_url,
-                summary.live_sync.processed_message_count,
-            );
+            if let Some(overview) = summary.live_sync.latest_market_overview.as_ref() {
+                println!(
+                    "persisted {} candles, latest snapshot at {}, live streams {}, processed {} live messages, regime {:?}, direction {:?}, last price {:.2}",
+                    summary.bootstrap.persisted_candle_count,
+                    summary.bootstrap.snapshot_observed_at_ms,
+                    summary.bootstrap.websocket_stream_url,
+                    summary.live_sync.processed_message_count,
+                    overview.regime_snapshot.regime_label,
+                    overview.scenario_snapshot.expected_direction,
+                    overview.live_price_snapshot.last_price.0,
+                );
+            } else {
+                println!(
+                    "persisted {} candles, latest snapshot at {}, live streams {}, processed {} live messages",
+                    summary.bootstrap.persisted_candle_count,
+                    summary.bootstrap.snapshot_observed_at_ms,
+                    summary.bootstrap.websocket_stream_url,
+                    summary.live_sync.processed_message_count,
+                );
+            }
         }
         Err(error) => {
             eprintln!("bootstrap ingestion failed: {error}");
@@ -291,6 +332,7 @@ mod tests {
     use super::config::AppConfig;
     use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask};
     use persistence_core::sqlite::SqliteMarketDataStore;
+    use scenario_core::{ExpectedDirection, MarketRegimeLabel};
 
     #[test]
     fn ingests_payloads_into_sqlite_store() {
@@ -319,6 +361,13 @@ mod tests {
         assert_eq!(summary.persisted_candle_count, 2);
         assert_eq!(summary.snapshot_observed_at_ms, 1_710_000_120_000);
         assert_eq!(summary.persisted_analytics_count, 3);
+        assert_eq!(
+            summary
+                .latest_market_overview
+                .as_ref()
+                .map(|overview| overview.regime_snapshot.regime_label),
+            Some(MarketRegimeLabel::Uptrend)
+        );
         assert_eq!(
             summary.websocket_stream_url,
             "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/btcusdt@miniTicker"
@@ -384,6 +433,13 @@ mod tests {
         assert_eq!(summary.persisted_candle_update_count, 1);
         assert_eq!(summary.persisted_snapshot_update_count, 1);
         assert_eq!(summary.persisted_analytics_count, 3);
+        assert_eq!(
+            summary
+                .latest_market_overview
+                .as_ref()
+                .map(|overview| overview.scenario_snapshot.expected_direction),
+            Some(ExpectedDirection::Bullish)
+        );
         assert_eq!(store.count_rows("candles").unwrap(), 1);
         assert_eq!(store.count_rows("live_price_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
