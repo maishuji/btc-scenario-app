@@ -106,6 +106,10 @@ pub mod timeframe {
                 Self::OneWeek => 10_080,
             }
         }
+
+        pub fn from_stream_id(value: &str) -> Result<Self, String> {
+            value.parse().map_err(|error: &'static str| error.to_owned())
+        }
     }
 
     impl fmt::Display for Timeframe {

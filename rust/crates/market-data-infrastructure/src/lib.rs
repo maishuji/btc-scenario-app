@@ -5,9 +5,12 @@ use market_data_core::timeframe::Timeframe;
 use market_data_core::value_objects::{Price, Timestamp, Volume};
 use reqwest::blocking::Client as BlockingHttpClient;
 use serde_json::Value;
+use tungstenite::connect as websocket_connect;
+use tungstenite::Message as WebSocketMessage;
 
 pub mod clients {
     use super::BlockingHttpClient;
+    use super::{websocket_connect, WebSocketMessage};
     use serde_json::json;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,13 +134,54 @@ pub mod clients {
 
             Ok(payload.to_string())
         }
+
+        pub fn read_text_messages(
+            &self,
+            subscriptions: &[StreamSubscription],
+            max_messages: usize,
+        ) -> Result<Vec<String>, String> {
+            if max_messages == 0 {
+                return Ok(Vec::new());
+            }
+
+            let url = self.build_combined_stream_url(subscriptions)?;
+            let (mut socket, _) = websocket_connect(url).map_err(|error| error.to_string())?;
+            let mut messages = Vec::with_capacity(max_messages);
+
+            while messages.len() < max_messages {
+                match socket.read().map_err(|error| error.to_string())? {
+                    WebSocketMessage::Text(payload) => messages.push(payload.to_string()),
+                    WebSocketMessage::Binary(payload) => {
+                        let payload = String::from_utf8(payload.to_vec()).map_err(|error| error.to_string())?;
+                        messages.push(payload);
+                    }
+                    WebSocketMessage::Ping(payload) => {
+                        socket
+                            .send(WebSocketMessage::Pong(payload))
+                            .map_err(|error| error.to_string())?;
+                    }
+                    WebSocketMessage::Close(_) => break,
+                    _ => {}
+                }
+            }
+
+            socket.close(None).map_err(|error| error.to_string())?;
+
+            Ok(messages)
+        }
     }
 }
 
 pub mod adapters {
     use super::clients::{RestMarketDataClient, RestRequest, StreamSubscription, WebSocketMarketDataClient};
-    use super::{parse_array_f64, parse_array_i64, parse_json, parse_string_f64, parse_string_i64};
+    use super::{parse_array_f64, parse_array_i64, parse_json, parse_string_bool, parse_string_f64, parse_string_i64};
     use super::{Candle, Instrument, LivePriceSnapshot, Price, Timeframe, Timestamp, Volume, Value};
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum BinanceStreamEvent {
+        Kline(Candle),
+        MiniTicker(LivePriceSnapshot),
+    }
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct BinanceMarketDataAdapter;
@@ -292,6 +336,71 @@ pub mod adapters {
                 .map(|record| self.parse_kline_record(instrument, timeframe, record))
                 .collect()
         }
+
+        pub fn parse_combined_stream_payload(
+            self,
+            instrument: &Instrument,
+            payload: &str,
+        ) -> Result<BinanceStreamEvent, String> {
+            let document = parse_json(payload)?;
+            let stream_name = document
+                .get("stream")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing stream field".to_owned())?;
+            let data = document
+                .get("data")
+                .ok_or_else(|| "missing data field".to_owned())?;
+
+            if stream_name.contains("@kline_") {
+                let kline = data
+                    .get("k")
+                    .ok_or_else(|| "missing kline payload".to_owned())?;
+                let timeframe = Timeframe::from_stream_id(
+                    kline
+                        .get("i")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing kline interval".to_owned())?,
+                )?;
+
+                let candle = Candle {
+                    instrument_id: instrument.id.clone(),
+                    source_id: "binance".to_owned(),
+                    timeframe,
+                    open_time: Timestamp::new(parse_string_i64(kline, "t")?).map_err(str::to_owned)?,
+                    close_time: Timestamp::new(parse_string_i64(kline, "T")?).map_err(str::to_owned)?,
+                    open: Price::new(parse_string_f64(kline, "o")?).map_err(str::to_owned)?,
+                    high: Price::new(parse_string_f64(kline, "h")?).map_err(str::to_owned)?,
+                    low: Price::new(parse_string_f64(kline, "l")?).map_err(str::to_owned)?,
+                    close: Price::new(parse_string_f64(kline, "c")?).map_err(str::to_owned)?,
+                    volume: Volume::new(parse_string_f64(kline, "v")?).map_err(str::to_owned)?,
+                    trade_count: parse_string_i64(kline, "n")? as u64,
+                    is_final: parse_string_bool(kline, "x")?,
+                };
+
+                return Ok(BinanceStreamEvent::Kline(candle));
+            }
+
+            if stream_name.ends_with("@miniTicker") {
+                let open_price = parse_string_f64(data, "o")?;
+                let last_price = parse_string_f64(data, "c")?;
+                let price_change_24h = if open_price == 0.0 {
+                    0.0
+                } else {
+                    ((last_price - open_price) / open_price) * 100.0
+                };
+
+                return Ok(BinanceStreamEvent::MiniTicker(LivePriceSnapshot {
+                    instrument_id: instrument.id.clone(),
+                    source_id: "binance".to_owned(),
+                    last_price: Price::new(last_price).map_err(str::to_owned)?,
+                    price_change_24h,
+                    volume_24h: Volume::new(parse_string_f64(data, "v")?).map_err(str::to_owned)?,
+                    observed_at: Timestamp::new(parse_string_i64(data, "E")?).map_err(str::to_owned)?,
+                }));
+            }
+
+            Err(format!("unsupported combined stream payload: {stream_name}"))
+        }
     }
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -425,6 +534,13 @@ fn parse_string_i64(value: &Value, field: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("missing integer field: {field}"))
 }
 
+fn parse_string_bool(value: &Value, field: &str) -> Result<bool, String> {
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("missing boolean field: {field}"))
+}
+
 fn parse_array_f64(value: &Value, index: usize) -> Result<f64, String> {
     value
         .get(index)
@@ -443,7 +559,7 @@ fn parse_array_i64(value: &Value, index: usize) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::adapters::BinanceMarketDataAdapter;
+    use super::adapters::{BinanceMarketDataAdapter, BinanceStreamEvent};
     use super::clients::{StreamSubscription, WebSocketMarketDataClient};
     use super::health::{SourceHealthMonitor, SourceStatus};
     use super::normalization::SymbolMapper;
@@ -603,6 +719,79 @@ mod tests {
         assert_eq!(candles.len(), 2);
         assert_eq!(candles[0].open.0, 68_000.0);
         assert_eq!(candles[1].close.0, 68_500.0);
+    }
+
+    #[test]
+    fn parses_combined_kline_stream_payload() {
+        let adapter = BinanceMarketDataAdapter;
+        let event = adapter
+            .parse_combined_stream_payload(
+                &Instrument::btc_usd_spot(),
+                r#"{
+                    "stream":"btcusdt@kline_1m",
+                    "data":{
+                        "e":"kline",
+                        "E":1710000120000,
+                        "s":"BTCUSDT",
+                        "k":{
+                            "t":1710000060000,
+                            "T":1710000119999,
+                            "s":"BTCUSDT",
+                            "i":"1m",
+                            "o":"68450.12",
+                            "c":"68500.00",
+                            "h":"68600.00",
+                            "l":"68400.00",
+                            "v":"95.00",
+                            "n":31,
+                            "x":false
+                        }
+                    }
+                }"#,
+            )
+            .expect("combined kline payload should parse");
+
+        match event {
+            BinanceStreamEvent::Kline(candle) => {
+                assert_eq!(candle.timeframe, Timeframe::OneMinute);
+                assert_eq!(candle.close.0, 68_500.0);
+                assert!(!candle.is_final);
+            }
+            _ => panic!("expected kline event"),
+        }
+    }
+
+    #[test]
+    fn parses_combined_mini_ticker_stream_payload() {
+        let adapter = BinanceMarketDataAdapter;
+        let event = adapter
+            .parse_combined_stream_payload(
+                &Instrument::btc_usd_spot(),
+                r#"{
+                    "stream":"btcusdt@miniTicker",
+                    "data":{
+                        "e":"24hrMiniTicker",
+                        "E":1710000120000,
+                        "s":"BTCUSDT",
+                        "c":"68500.00",
+                        "o":"68000.00",
+                        "h":"68600.00",
+                        "l":"67900.00",
+                        "v":"8913.3",
+                        "q":"0"
+                    }
+                }"#,
+            )
+            .expect("combined mini ticker payload should parse");
+
+        match event {
+            BinanceStreamEvent::MiniTicker(snapshot) => {
+                assert_eq!(snapshot.last_price.0, 68_500.0);
+                assert!(snapshot.price_change_24h > 0.7);
+                assert_eq!(snapshot.observed_at.0, 1_710_000_120_000);
+            }
+            _ => panic!("expected mini ticker event"),
+        }
     }
 
     #[test]
