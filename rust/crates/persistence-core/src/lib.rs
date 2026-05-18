@@ -108,3 +108,61 @@ pub mod writes {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    const INITIAL_MIGRATION: &str =
+        include_str!("../../../../db/migrations/0001_initial_schema.sql");
+
+    #[test]
+    fn applies_initial_schema_migration() {
+        let connection = Connection::open_in_memory().expect("in-memory sqlite connection");
+        connection
+            .execute_batch(INITIAL_MIGRATION)
+            .expect("migration should apply cleanly");
+
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                    'instruments',
+                    'data_sources',
+                    'candles',
+                    'live_price_snapshots',
+                    'feature_snapshots',
+                    'regime_snapshots',
+                    'scenario_snapshots',
+                    'alerts',
+                    'source_health_events'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table count query should succeed");
+
+        assert_eq!(table_count, 9);
+    }
+
+    #[test]
+    fn seeds_canonical_instrument_and_sources() {
+        let connection = Connection::open_in_memory().expect("in-memory sqlite connection");
+        connection
+            .execute_batch(INITIAL_MIGRATION)
+            .expect("migration should apply cleanly");
+
+        let instrument_symbol: String = connection
+            .query_row(
+                "SELECT symbol FROM instruments WHERE id = 'BTC-USD-SPOT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("seeded instrument should exist");
+        let source_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM data_sources", [], |row| row.get(0))
+            .expect("seeded data sources should exist");
+
+        assert_eq!(instrument_symbol, "BTC-USD-SPOT");
+        assert_eq!(source_count, 3);
+    }
+}
