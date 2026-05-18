@@ -4,6 +4,7 @@ mod config {
         pub instrument_symbol: String,
         pub primary_exchange_symbol: String,
         pub market_data_db_path: String,
+        pub api_bind_address: String,
         pub live_sync_message_limit: usize,
     }
 
@@ -13,8 +14,148 @@ mod config {
                 instrument_symbol: "BTC-USD-SPOT".to_owned(),
                 primary_exchange_symbol: "BTCUSDT".to_owned(),
                 market_data_db_path: "var/market-data.sqlite3".to_owned(),
+                api_bind_address: "127.0.0.1:3000".to_owned(),
                 live_sync_message_limit: 2,
             }
+        }
+    }
+}
+
+mod api {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use persistence_core::models::LatestMarketOverviewRecord;
+    use persistence_core::queries::{LatestMarketOverviewQuery, MarketOverviewQueryService};
+    use persistence_core::sqlite::SqliteMarketDataStore;
+    use serde::Serialize;
+
+    use crate::config::AppConfig;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ApiState {
+        pub market_data_db_path: String,
+        pub instrument_id: String,
+    }
+
+    impl ApiState {
+        pub fn from_config(config: &AppConfig) -> Self {
+            Self {
+                market_data_db_path: config.market_data_db_path.clone(),
+                instrument_id: config.instrument_symbol.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct MarketOverviewResponse {
+        pub instrument_id: String,
+        pub timeframe: String,
+        pub observed_at_ms: i64,
+        pub last_price: f64,
+        pub price_change_24h: f64,
+        pub volume_24h: f64,
+        pub trend_score: f64,
+        pub momentum_score: f64,
+        pub volatility_score: f64,
+        pub volume_confirmation_score: f64,
+        pub support_distance: f64,
+        pub resistance_distance: f64,
+        pub level_reaction_score: f64,
+        pub regime_label: String,
+        pub regime_score: f64,
+        pub bull_probability: f64,
+        pub base_probability: f64,
+        pub bear_probability: f64,
+        pub trigger_level: f64,
+        pub invalidation_level: f64,
+        pub expected_direction: String,
+        pub explanation: String,
+    }
+
+    impl MarketOverviewResponse {
+        pub fn from_record(record: LatestMarketOverviewRecord) -> Self {
+            Self {
+                instrument_id: record.scenario_snapshot.instrument_id,
+                timeframe: record.scenario_snapshot.timeframe.as_str().to_owned(),
+                observed_at_ms: record.scenario_snapshot.observed_at.0,
+                last_price: record.live_price_snapshot.last_price.0,
+                price_change_24h: record.live_price_snapshot.price_change_24h,
+                volume_24h: record.live_price_snapshot.volume_24h.0,
+                trend_score: record.feature_snapshot.trend_score,
+                momentum_score: record.feature_snapshot.momentum_score,
+                volatility_score: record.feature_snapshot.volatility_score,
+                volume_confirmation_score: record.feature_snapshot.volume_confirmation_score,
+                support_distance: record.feature_snapshot.support_distance,
+                resistance_distance: record.feature_snapshot.resistance_distance,
+                level_reaction_score: record.feature_snapshot.level_reaction_score,
+                regime_label: regime_label_as_str(record.regime_snapshot.regime_label).to_owned(),
+                regime_score: record.regime_snapshot.regime_score,
+                bull_probability: record.scenario_snapshot.bull_probability,
+                base_probability: record.scenario_snapshot.base_probability,
+                bear_probability: record.scenario_snapshot.bear_probability,
+                trigger_level: record.scenario_snapshot.trigger_level,
+                invalidation_level: record.scenario_snapshot.invalidation_level,
+                expected_direction: expected_direction_as_str(record.scenario_snapshot.expected_direction).to_owned(),
+                explanation: record.scenario_snapshot.explanation,
+            }
+        }
+    }
+
+    pub fn build_router(state: ApiState) -> Router {
+        Router::new()
+            .route("/api/market-overview", get(get_market_overview))
+            .with_state(state)
+    }
+
+    pub async fn serve(config: &AppConfig) -> Result<(), String> {
+        let state = ApiState::from_config(config);
+        let router = build_router(state);
+        let listener = tokio::net::TcpListener::bind(&config.api_bind_address)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        axum::serve(listener, router)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn get_market_overview(
+        State(state): State<ApiState>,
+    ) -> Result<Json<MarketOverviewResponse>, StatusCode> {
+        let store = SqliteMarketDataStore::open(&state.market_data_db_path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .apply_migrations()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let query = LatestMarketOverviewQuery::for_instrument(
+            state.instrument_id,
+            market_data_core::timeframe::Timeframe::OneMinute,
+        );
+        let overview = MarketOverviewQueryService
+            .load_latest(&store, &query)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+        Ok(Json(MarketOverviewResponse::from_record(overview)))
+    }
+
+    fn regime_label_as_str(value: scenario_core::MarketRegimeLabel) -> &'static str {
+        match value {
+            scenario_core::MarketRegimeLabel::Uptrend => "uptrend",
+            scenario_core::MarketRegimeLabel::Downtrend => "downtrend",
+            scenario_core::MarketRegimeLabel::Range => "range",
+            scenario_core::MarketRegimeLabel::HighVolatilityTransition => "high_volatility_transition",
+        }
+    }
+
+    fn expected_direction_as_str(value: scenario_core::ExpectedDirection) -> &'static str {
+        match value {
+            scenario_core::ExpectedDirection::Bullish => "bullish",
+            scenario_core::ExpectedDirection::Neutral => "neutral",
+            scenario_core::ExpectedDirection::Bearish => "bearish",
         }
     }
 }
@@ -293,8 +434,17 @@ mod bootstrap {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = config::AppConfig::default();
+    if std::env::args().nth(1).as_deref() == Some("serve-api") {
+        if let Err(error) = api::serve(&config).await {
+            eprintln!("api server failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let runtime = bootstrap::Bootstrap.build(&config);
 
     match runtime.run() {
@@ -329,10 +479,23 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::State;
     use super::config::AppConfig;
+    use super::api::{get_market_overview, ApiState};
     use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask};
     use persistence_core::sqlite::SqliteMarketDataStore;
     use scenario_core::{ExpectedDirection, MarketRegimeLabel};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path(test_name: &str) -> String {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!("{test_name}-{unique}.sqlite3"));
+        path.to_string_lossy().into_owned()
+    }
 
     #[test]
     fn ingests_payloads_into_sqlite_store() {
@@ -445,5 +608,46 @@ mod tests {
         assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn returns_market_overview_from_api_handler() {
+        let db_path = temp_db_path("market-overview-handler");
+        let config = AppConfig {
+            market_data_db_path: db_path.clone(),
+            ..AppConfig::default()
+        };
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        BinanceBootstrapIngestionTask
+            .ingest_from_payloads(
+                &config,
+                &store,
+                r#"[
+                    [1710000000000,"68000.00","68500.00","67950.00","68450.12","123.45",1710000059999,"0",42,"0","0","0"],
+                    [1710000060000,"68450.12","68600.00","68400.00","68500.00","95.00",1710000119999,"0",31,"0","0","0"]
+                ]"#,
+                r#"{
+                    "symbol":"BTCUSDT",
+                    "priceChangePercent":"3.12",
+                    "lastPrice":"68500.00",
+                    "volume":"8913.3",
+                    "closeTime":1710000120000
+                }"#,
+            )
+            .expect("bootstrap ingestion should succeed");
+
+        let response = get_market_overview(State(ApiState::from_config(&config)))
+            .await
+            .expect("api handler should return market overview");
+
+        assert_eq!(response.0.instrument_id, "BTC-USD-SPOT");
+        assert_eq!(response.0.timeframe, "1m");
+        assert_eq!(response.0.last_price, 68_500.0);
+        assert_eq!(response.0.regime_label, "uptrend");
+        assert_eq!(response.0.expected_direction, "bullish");
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

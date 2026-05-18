@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = "0.8"
 market-data-core = { path = "../market-data-core" }
 market-data-infrastructure = { path = "../market-data-infrastructure" }
 persistence-core = { path = "../persistence-core" }
+serde = { version = "1", features = ["derive"] }
 scenario-core = { path = "../scenario-core" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 
