@@ -27,8 +27,10 @@ mod api {
     use axum::routing::get;
     use axum::{Json, Router};
     use market_data_core::timeframe::Timeframe;
-    use persistence_core::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use persistence_core::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
     use persistence_core::queries::{
+        AlertHistoryQuery,
+        AlertHistoryQueryService,
         CandleHistoryQuery,
         CandleHistoryQueryService,
         LatestMarketOverviewQuery,
@@ -183,11 +185,37 @@ mod api {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct AlertResponse {
+        pub instrument_id: String,
+        pub timeframe: String,
+        pub alert_type: String,
+        pub severity: String,
+        pub message: String,
+        pub triggered_at_ms: i64,
+        pub is_acknowledged: bool,
+    }
+
+    impl AlertResponse {
+        fn from_record(record: AlertRecord) -> Self {
+            Self {
+                instrument_id: record.instrument_id,
+                timeframe: record.timeframe.as_str().to_owned(),
+                alert_type: record.alert_type,
+                severity: record.severity,
+                message: record.message,
+                triggered_at_ms: record.triggered_at_ms,
+                is_acknowledged: record.is_acknowledged,
+            }
+        }
+    }
+
     pub fn build_router(state: ApiState) -> Router {
         Router::new()
             .route("/api/market-overview", get(get_market_overview))
             .route("/api/candles", get(get_candles))
             .route("/api/scenario-history", get(get_scenario_history))
+            .route("/api/alerts", get(get_alerts))
             .with_state(state)
     }
 
@@ -255,6 +283,26 @@ mod api {
         ))
     }
 
+    pub async fn get_alerts(
+        State(state): State<ApiState>,
+        Query(params): Query<ApiListQuery>,
+    ) -> Result<Json<Vec<AlertResponse>>, StatusCode> {
+        let store = open_store(&state)?;
+        let timeframe = parse_timeframe(params.timeframe.as_deref())?;
+        let limit = normalize_limit(params.limit, 50);
+        let query = AlertHistoryQuery::for_instrument(state.instrument_id, timeframe, limit);
+        let alerts = AlertHistoryQueryService
+            .load(&store, &query)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(
+            alerts
+                .into_iter()
+                .map(AlertResponse::from_record)
+                .collect(),
+        ))
+    }
+
     fn open_store(state: &ApiState) -> Result<SqliteMarketDataStore, StatusCode> {
         let store = SqliteMarketDataStore::open(&state.market_data_db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -303,9 +351,10 @@ mod tasks {
     use market_data_infrastructure::adapters::BinanceMarketDataAdapter;
     use market_data_infrastructure::adapters::BinanceStreamEvent;
     use market_data_core::timeframe::Timeframe;
-    use persistence_core::models::LatestMarketOverviewRecord;
+    use persistence_core::models::{AlertRecord, LatestMarketOverviewRecord};
     use persistence_core::queries::{LatestMarketOverviewQuery, MarketOverviewQueryService};
     use persistence_core::repositories::{
+        AlertRepository,
         CandleRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
@@ -314,7 +363,9 @@ mod tasks {
     };
     use persistence_core::sqlite::SqliteMarketDataStore;
     use scenario_core::{
+        ExpectedDirection,
         FeatureSnapshotBuilder,
+        MarketRegimeLabel,
         MarketRegimeStrategy,
         ScenarioExplanationBuilder,
         ScenarioSnapshotFactory,
@@ -344,6 +395,61 @@ mod tasks {
     #[derive(Debug, Default, Clone, Copy)]
     pub struct AnalyticsSnapshotPipeline;
 
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct SnapshotAlertFactory;
+
+    impl SnapshotAlertFactory {
+        pub fn build(
+            self,
+            previous_regime: Option<&scenario_core::MarketRegimeSnapshot>,
+            current_regime: &scenario_core::MarketRegimeSnapshot,
+            previous_scenario: Option<&scenario_core::ScenarioSnapshot>,
+            current_scenario: &scenario_core::ScenarioSnapshot,
+        ) -> Vec<AlertRecord> {
+            let mut alerts = Vec::new();
+
+            if let Some(previous_regime) = previous_regime {
+                if previous_regime.regime_label != current_regime.regime_label {
+                    alerts.push(AlertRecord {
+                        instrument_id: current_regime.instrument_id.clone(),
+                        timeframe: current_regime.timeframe,
+                        alert_type: "regime_changed".to_owned(),
+                        severity: regime_change_severity(current_regime.regime_label).to_owned(),
+                        message: format!(
+                            "Regime changed from {} to {}",
+                            regime_label_as_str(previous_regime.regime_label),
+                            regime_label_as_str(current_regime.regime_label),
+                        ),
+                        triggered_at_ms: current_regime.observed_at.0,
+                        scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
+                        is_acknowledged: false,
+                    });
+                }
+            }
+
+            if let Some(previous_scenario) = previous_scenario {
+                if previous_scenario.expected_direction != current_scenario.expected_direction {
+                    alerts.push(AlertRecord {
+                        instrument_id: current_scenario.instrument_id.clone(),
+                        timeframe: current_scenario.timeframe,
+                        alert_type: "scenario_shifted".to_owned(),
+                        severity: "warning".to_owned(),
+                        message: format!(
+                            "Scenario direction shifted from {} to {}",
+                            expected_direction_as_str(previous_scenario.expected_direction),
+                            expected_direction_as_str(current_scenario.expected_direction),
+                        ),
+                        triggered_at_ms: current_scenario.observed_at.0,
+                        scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
+                        is_acknowledged: false,
+                    });
+                }
+            }
+
+            alerts
+        }
+    }
+
     impl AnalyticsSnapshotPipeline {
         pub fn compute_and_persist(
             self,
@@ -356,12 +462,61 @@ mod tasks {
             let regime_snapshot = MarketRegimeStrategy.classify(&feature_snapshot);
             let explanation = ScenarioExplanationBuilder.build(&feature_snapshot, &regime_snapshot);
             let scenario_snapshot = ScenarioSnapshotFactory.build(&feature_snapshot, &regime_snapshot, explanation);
+            let previous_regime_snapshot = store
+                .load_latest_regime_snapshot(&regime_snapshot.instrument_id, regime_snapshot.timeframe)
+                .map_err(|error| error.to_string())?;
+            let previous_scenario_snapshot = store
+                .load_latest_scenario_snapshot(&scenario_snapshot.instrument_id, scenario_snapshot.timeframe)
+                .map_err(|error| error.to_string())?;
 
             FeatureSnapshotRepository::save(store, &feature_snapshot).map_err(|error| error.to_string())?;
             RegimeSnapshotRepository::save(store, &regime_snapshot).map_err(|error| error.to_string())?;
             ScenarioSnapshotRepository::save(store, &scenario_snapshot).map_err(|error| error.to_string())?;
 
+            for alert in SnapshotAlertFactory.build(
+                previous_regime_snapshot.as_ref(),
+                &regime_snapshot,
+                previous_scenario_snapshot.as_ref(),
+                &scenario_snapshot,
+            ) {
+                AlertRepository::save(store, &alert).map_err(|error| error.to_string())?;
+            }
+
             Ok(3)
+        }
+    }
+
+    fn scenario_snapshot_identifier(snapshot: &scenario_core::ScenarioSnapshot) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            snapshot.instrument_id,
+            snapshot.timeframe,
+            snapshot.observed_at.0,
+            "v1"
+        )
+    }
+
+    fn regime_change_severity(label: MarketRegimeLabel) -> &'static str {
+        match label {
+            MarketRegimeLabel::HighVolatilityTransition => "warning",
+            MarketRegimeLabel::Uptrend | MarketRegimeLabel::Downtrend | MarketRegimeLabel::Range => "info",
+        }
+    }
+
+    fn regime_label_as_str(label: MarketRegimeLabel) -> &'static str {
+        match label {
+            MarketRegimeLabel::Uptrend => "uptrend",
+            MarketRegimeLabel::Downtrend => "downtrend",
+            MarketRegimeLabel::Range => "range",
+            MarketRegimeLabel::HighVolatilityTransition => "high_volatility_transition",
+        }
+    }
+
+    fn expected_direction_as_str(direction: ExpectedDirection) -> &'static str {
+        match direction {
+            ExpectedDirection::Bullish => "bullish",
+            ExpectedDirection::Neutral => "neutral",
+            ExpectedDirection::Bearish => "bearish",
         }
     }
 
@@ -615,11 +770,14 @@ async fn main() {
 mod tests {
     use axum::extract::State;
     use super::config::AppConfig;
-    use super::api::{get_candles, get_market_overview, get_scenario_history, ApiListQuery, ApiState};
+    use super::api::{get_alerts, get_candles, get_market_overview, get_scenario_history, ApiListQuery, ApiState};
     use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask};
     use axum::extract::Query;
+    use persistence_core::repositories::AlertHistoryQueryRepository;
+    use persistence_core::repositories::RegimeSnapshotRepository;
     use persistence_core::sqlite::SqliteMarketDataStore;
     use persistence_core::repositories::ScenarioSnapshotRepository;
+    use rusqlite::{params, Connection};
     use scenario_core::{ExpectedDirection, MarketRegimeLabel};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -744,6 +902,82 @@ mod tests {
         assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
+    }
+
+    #[test]
+    fn generates_alerts_when_snapshot_state_changes() {
+        let config = AppConfig::default();
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let previous_regime_snapshot = scenario_core::MarketRegimeSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            timeframe: market_data_core::timeframe::Timeframe::OneMinute,
+            observed_at: market_data_core::value_objects::Timestamp::new(1_710_000_000_000).unwrap(),
+            regime_label: scenario_core::MarketRegimeLabel::Downtrend,
+            regime_score: 400.0,
+        };
+        let previous_scenario_snapshot = scenario_core::ScenarioSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            timeframe: market_data_core::timeframe::Timeframe::OneMinute,
+            observed_at: market_data_core::value_objects::Timestamp::new(1_710_000_000_000).unwrap(),
+            bull_probability: 0.15,
+            base_probability: 0.30,
+            bear_probability: 0.55,
+            trigger_level: 150.0,
+            invalidation_level: 100.0,
+            expected_direction: scenario_core::ExpectedDirection::Bearish,
+            explanation: "BTC scenario was bearish".to_owned(),
+        };
+
+        RegimeSnapshotRepository::save(&store, &previous_regime_snapshot)
+            .expect("previous regime snapshot should save");
+        ScenarioSnapshotRepository::save(&store, &previous_scenario_snapshot)
+            .expect("previous scenario snapshot should save");
+
+        let summary = BinanceBootstrapIngestionTask
+            .ingest_from_payloads(
+                &config,
+                &store,
+                r#"[
+                    [1710000000000,"68000.00","68500.00","67950.00","68450.12","123.45",1710000059999,"0",42,"0","0","0"],
+                    [1710000060000,"68450.12","68600.00","68400.00","68500.00","95.00",1710000119999,"0",31,"0","0","0"]
+                ]"#,
+                r#"{
+                    "symbol":"BTCUSDT",
+                    "priceChangePercent":"3.12",
+                    "lastPrice":"68500.00",
+                    "volume":"8913.3",
+                    "closeTime":1710000120000
+                }"#,
+            )
+            .expect("bootstrap ingestion should succeed");
+
+        assert_eq!(summary.persisted_analytics_count, 3);
+        let observed_at_ms = summary
+            .latest_market_overview
+            .as_ref()
+            .expect("latest market overview should exist")
+            .scenario_snapshot
+            .observed_at
+            .0;
+
+        let alerts = AlertHistoryQueryRepository::load_alert_history(
+            &store,
+            "BTC-USD-SPOT",
+            market_data_core::timeframe::Timeframe::OneMinute,
+            10,
+        )
+        .expect("alert history should load");
+
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts.iter().any(|alert| alert.alert_type == "regime_changed"));
+        assert!(alerts.iter().any(|alert| alert.alert_type == "scenario_shifted"));
+        assert!(alerts.iter().all(|alert| alert.triggered_at_ms == observed_at_ms));
+        assert!(alerts.iter().all(|alert| !alert.is_acknowledged));
+        assert!(alerts.iter().all(|alert| alert.scenario_snapshot_id.as_deref() == Some(format!("BTC-USD-SPOT:1m:{observed_at_ms}:v1").as_str())));
+        assert!(alerts.iter().any(|alert| alert.message == "Regime changed from downtrend to uptrend"));
+        assert!(alerts.iter().any(|alert| alert.message == "Scenario direction shifted from bearish to bullish"));
     }
 
     #[tokio::test]
@@ -872,6 +1106,83 @@ mod tests {
         assert_eq!(response.0.len(), 2);
         assert_eq!(response.0[0].observed_at_ms, 1_710_000_060_000);
         assert_eq!(response.0[1].expected_direction, "bullish");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn returns_alert_history_from_api_handler() {
+        let db_path = temp_db_path("alert-history-handler");
+        let config = AppConfig {
+            market_data_db_path: db_path.clone(),
+            ..AppConfig::default()
+        };
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let connection = Connection::open(&db_path).expect("sqlite connection should open");
+        for (id, triggered_at_ms, alert_type, severity, message, is_acknowledged) in [
+            (
+                "alert-1",
+                1_710_000_060_000_i64,
+                "regime_changed",
+                "info",
+                "Regime changed to uptrend",
+                0_i64,
+            ),
+            (
+                "alert-2",
+                1_710_000_120_000_i64,
+                "scenario_shifted",
+                "warning",
+                "Scenario shifted bullish",
+                1_i64,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO alerts (
+                        id,
+                        instrument_id,
+                        timeframe,
+                        alert_type,
+                        severity,
+                        message,
+                        triggered_at_ms,
+                        scenario_snapshot_id,
+                        is_acknowledged,
+                        created_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+                    params![
+                        id,
+                        "BTC-USD-SPOT",
+                        "1m",
+                        alert_type,
+                        severity,
+                        message,
+                        triggered_at_ms,
+                        is_acknowledged,
+                        triggered_at_ms,
+                    ],
+                )
+                .expect("alert row should insert");
+        }
+
+        let response = get_alerts(
+            State(ApiState::from_config(&config)),
+            Query(ApiListQuery {
+                timeframe: Some("1m".to_owned()),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("api handler should return alerts");
+
+        assert_eq!(response.0.len(), 2);
+        assert_eq!(response.0[0].triggered_at_ms, 1_710_000_060_000);
+        assert_eq!(response.0[0].alert_type, "regime_changed");
+        assert_eq!(response.0[1].severity, "warning");
+        assert!(response.0[1].is_acknowledged);
 
         let _ = std::fs::remove_file(db_path);
     }

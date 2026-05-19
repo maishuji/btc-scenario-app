@@ -3,6 +3,8 @@ use market_data_core::snapshot::LivePriceSnapshot;
 use scenario_core::{FeatureSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
 pub mod models {
+    use market_data_core::timeframe::Timeframe;
+
     use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
     #[derive(Debug, Clone, PartialEq)]
@@ -41,16 +43,20 @@ pub mod models {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct AlertRecord {
         pub instrument_id: String,
+        pub timeframe: Timeframe,
         pub alert_type: String,
+        pub severity: String,
         pub message: String,
         pub triggered_at_ms: i64,
+        pub scenario_snapshot_id: Option<String>,
+        pub is_acknowledged: bool,
     }
 }
 
 pub mod repositories {
     use market_data_core::timeframe::Timeframe;
 
-    use super::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use super::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
     use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
     pub trait CandleRepository {
@@ -81,6 +87,12 @@ pub mod repositories {
         type Error;
 
         fn save(&self, snapshot: &ScenarioSnapshot) -> Result<(), Self::Error>;
+    }
+
+    pub trait AlertRepository {
+        type Error;
+
+        fn save(&self, alert: &AlertRecord) -> Result<(), Self::Error>;
     }
 
     pub trait MarketOverviewQueryRepository {
@@ -114,6 +126,17 @@ pub mod repositories {
             limit: usize,
         ) -> Result<Vec<ScenarioSnapshotRecord>, Self::Error>;
     }
+
+    pub trait AlertHistoryQueryRepository {
+        type Error;
+
+        fn load_alert_history(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<AlertRecord>, Self::Error>;
+    }
 }
 
 pub mod sqlite {
@@ -122,8 +145,10 @@ pub mod sqlite {
 
     use rusqlite::{params, Connection, OptionalExtension};
 
-    use super::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use super::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
     use super::repositories::{
+        AlertHistoryQueryRepository,
+        AlertRepository,
         CandleHistoryQueryRepository,
         CandleRepository,
         FeatureSnapshotRepository,
@@ -229,6 +254,58 @@ pub mod sqlite {
             let mut candles = rows.collect::<Result<Vec<_>, _>>()?;
             candles.reverse();
             Ok(candles)
+        }
+
+        pub fn load_recent_alerts(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<AlertRecord>, rusqlite::Error> {
+            let connection = self.connection.borrow();
+            let mut statement = connection.prepare(
+                "SELECT
+                    instrument_id,
+                    timeframe,
+                    alert_type,
+                    severity,
+                    message,
+                    triggered_at_ms,
+                    scenario_snapshot_id,
+                    is_acknowledged
+                 FROM alerts
+                 WHERE instrument_id = ?1 AND timeframe = ?2
+                 ORDER BY triggered_at_ms DESC
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![instrument_id, timeframe.as_str(), limit as i64],
+                |row| {
+                    let timeframe_text: String = row.get(1)?;
+                    let timeframe = timeframe_text.parse::<Timeframe>().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+
+                    Ok(AlertRecord {
+                        instrument_id: row.get(0)?,
+                        timeframe,
+                        alert_type: row.get(2)?,
+                        severity: row.get(3)?,
+                        message: row.get(4)?,
+                        triggered_at_ms: row.get(5)?,
+                        scenario_snapshot_id: row.get(6)?,
+                        is_acknowledged: row.get::<_, i64>(7)? == 1,
+                    })
+                },
+            )?;
+
+            let mut alerts = rows.collect::<Result<Vec<_>, _>>()?;
+            alerts.reverse();
+            Ok(alerts)
         }
 
         fn load_latest_live_price_snapshot(
@@ -351,7 +428,47 @@ pub mod sqlite {
             .optional()
         }
 
-        fn load_latest_scenario_snapshot(
+        pub fn load_latest_regime_snapshot(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+        ) -> Result<Option<MarketRegimeSnapshot>, rusqlite::Error> {
+            self.connection.borrow().query_row(
+                "SELECT
+                    instrument_id,
+                    timeframe,
+                    observed_at_ms,
+                    regime_label,
+                    regime_score
+                 FROM regime_snapshots
+                 WHERE instrument_id = ?1 AND timeframe = ?2
+                 ORDER BY observed_at_ms DESC
+                 LIMIT 1",
+                params![instrument_id, timeframe.as_str()],
+                |row| {
+                    let timeframe_text: String = row.get(1)?;
+                    let timeframe = timeframe_text.parse::<Timeframe>().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+                    let regime_label = parse_regime_label(row.get::<_, String>(3)?.as_str())?;
+
+                    Ok(MarketRegimeSnapshot {
+                        instrument_id: row.get(0)?,
+                        timeframe,
+                        observed_at: Timestamp::new(row.get(2)?).map_err(sqlite_mapping_error)?,
+                        regime_label,
+                        regime_score: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        }
+
+        pub fn load_latest_scenario_snapshot(
             &self,
             instrument_id: &str,
             timeframe: Timeframe,
@@ -733,6 +850,48 @@ pub mod sqlite {
         }
     }
 
+    impl AlertRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn save(&self, alert: &AlertRecord) -> Result<(), Self::Error> {
+            let identifier = format!(
+                "{}:{}:{}:{}",
+                alert.instrument_id,
+                alert.timeframe,
+                alert.alert_type,
+                alert.triggered_at_ms,
+            );
+            self.connection.borrow().execute(
+                "INSERT OR REPLACE INTO alerts (
+                    id,
+                    instrument_id,
+                    timeframe,
+                    alert_type,
+                    severity,
+                    message,
+                    triggered_at_ms,
+                    scenario_snapshot_id,
+                    is_acknowledged,
+                    created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    identifier,
+                    alert.instrument_id,
+                    alert.timeframe.as_str(),
+                    alert.alert_type,
+                    alert.severity,
+                    alert.message,
+                    alert.triggered_at_ms,
+                    alert.scenario_snapshot_id,
+                    if alert.is_acknowledged { 1_i64 } else { 0_i64 },
+                    alert.triggered_at_ms,
+                ],
+            )?;
+
+            Ok(())
+        }
+    }
+
     impl MarketOverviewQueryRepository for SqliteMarketDataStore {
         type Error = rusqlite::Error;
 
@@ -798,13 +957,31 @@ pub mod sqlite {
                 .map(|snapshots| snapshots.into_iter().map(|snapshot| ScenarioSnapshotRecord { snapshot }).collect())
         }
     }
+
+    impl AlertHistoryQueryRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn load_alert_history(
+            &self,
+            instrument_id: &str,
+            timeframe: Timeframe,
+            limit: usize,
+        ) -> Result<Vec<AlertRecord>, Self::Error> {
+            self.load_recent_alerts(instrument_id, timeframe, limit)
+        }
+    }
 }
 
 pub mod queries {
     use market_data_core::timeframe::Timeframe;
 
-    use super::models::{CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
-    use super::repositories::{CandleHistoryQueryRepository, MarketOverviewQueryRepository, ScenarioHistoryQueryRepository};
+    use super::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use super::repositories::{
+        AlertHistoryQueryRepository,
+        CandleHistoryQueryRepository,
+        MarketOverviewQueryRepository,
+        ScenarioHistoryQueryRepository,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct LatestMarketOverviewQuery {
@@ -898,6 +1075,35 @@ pub mod queries {
             repository.load_scenario_history(&query.instrument_id, query.timeframe, query.limit)
         }
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AlertHistoryQuery {
+        pub instrument_id: String,
+        pub timeframe: Timeframe,
+        pub limit: usize,
+    }
+
+    impl AlertHistoryQuery {
+        pub fn for_instrument(instrument_id: impl Into<String>, timeframe: Timeframe, limit: usize) -> Self {
+            Self {
+                instrument_id: instrument_id.into(),
+                timeframe,
+                limit,
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct AlertHistoryQueryService;
+
+    impl AlertHistoryQueryService {
+        pub fn load<R>(self, repository: &R, query: &AlertHistoryQuery) -> Result<Vec<AlertRecord>, R::Error>
+        where
+            R: AlertHistoryQueryRepository,
+        {
+            repository.load_alert_history(&query.instrument_id, query.timeframe, query.limit)
+        }
+    }
 }
 
 pub mod writes {
@@ -936,16 +1142,20 @@ mod tests {
     use market_data_core::snapshot::LivePriceSnapshot;
     use market_data_core::timeframe::Timeframe;
     use market_data_core::value_objects::{Price, Timestamp, Volume};
+    use rusqlite::params;
     use rusqlite::Connection;
     use scenario_core::{
+        ExpectedDirection,
         FeatureSnapshot,
         MarketRegimeLabel,
         MarketRegimeSnapshot,
         ScenarioSnapshot,
-        ExpectedDirection,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::repositories::{
+        AlertHistoryQueryRepository,
+        AlertRepository,
         CandleHistoryQueryRepository,
         CandleRepository,
         FeatureSnapshotRepository,
@@ -957,6 +1167,16 @@ mod tests {
     };
     use super::sqlite::SqliteMarketDataStore;
     use super::Candle;
+
+    fn temp_db_path(test_name: &str) -> String {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!("{test_name}-{unique}.sqlite3"));
+        path.to_string_lossy().into_owned()
+    }
 
     const INITIAL_MIGRATION: &str =
         include_str!("../../../../db/migrations/0001_initial_schema.sql");
@@ -1104,6 +1324,27 @@ mod tests {
         assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
         assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
+    }
+
+    #[test]
+    fn sqlite_store_saves_alert_rows() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let alert = super::models::AlertRecord {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            timeframe: Timeframe::OneMinute,
+            alert_type: "scenario_shifted".to_owned(),
+            severity: "warning".to_owned(),
+            message: "Scenario direction shifted from bearish to bullish".to_owned(),
+            triggered_at_ms: 1_710_000_120_000,
+            scenario_snapshot_id: None,
+            is_acknowledged: false,
+        };
+
+        AlertRepository::save(&store, &alert).expect("alert should save");
+
+        assert_eq!(store.count_rows("alerts").unwrap(), 1);
     }
 
     #[test]
@@ -1280,5 +1521,64 @@ mod tests {
         assert_eq!(scenarios.len(), 2);
         assert_eq!(scenarios[0].snapshot.observed_at.0, 1_710_000_120_000);
         assert_eq!(scenarios[1].snapshot.observed_at.0, 1_710_000_180_000);
+    }
+
+    #[test]
+    fn sqlite_store_loads_alert_history_records() {
+        let db_path = temp_db_path("alert-history-query");
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let connection = Connection::open(&db_path).expect("sqlite connection should open");
+        for (id, triggered_at_ms, message, is_acknowledged) in [
+            ("alert-1", 1_710_000_060_000_i64, "Regime changed to uptrend", 0_i64),
+            ("alert-2", 1_710_000_120_000_i64, "Scenario shifted bullish", 1_i64),
+            ("alert-3", 1_710_000_180_000_i64, "Trigger crossed above resistance", 0_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO alerts (
+                        id,
+                        instrument_id,
+                        timeframe,
+                        alert_type,
+                        severity,
+                        message,
+                        triggered_at_ms,
+                        scenario_snapshot_id,
+                        is_acknowledged,
+                        created_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+                    params![
+                        id,
+                        "BTC-USD-SPOT",
+                        "1m",
+                        "scenario_shifted",
+                        "warning",
+                        message,
+                        triggered_at_ms,
+                        is_acknowledged,
+                        triggered_at_ms,
+                    ],
+                )
+                .expect("alert row should insert");
+        }
+
+        let alerts = AlertHistoryQueryRepository::load_alert_history(
+            &store,
+            "BTC-USD-SPOT",
+            Timeframe::OneMinute,
+            2,
+        )
+        .expect("alert history should load");
+
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].triggered_at_ms, 1_710_000_120_000);
+        assert_eq!(alerts[0].severity, "warning");
+        assert!(alerts[0].is_acknowledged);
+        assert_eq!(alerts[1].triggered_at_ms, 1_710_000_180_000);
+        assert_eq!(alerts[1].message, "Trigger crossed above resistance");
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

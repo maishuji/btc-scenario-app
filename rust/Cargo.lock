@@ -599,6 +599,7 @@ dependencies = [
  "market-data-core",
  "market-data-infrastructure",
  "persistence-core",
+ "rusqlite",
  "scenario-core",
  "serde",
  "tokio",

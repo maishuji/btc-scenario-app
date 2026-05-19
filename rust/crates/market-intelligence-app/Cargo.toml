@@ -12,3 +12,6 @@ serde = { version = "1", features = ["derive"] }
 scenario-core = { path = "../scenario-core" }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 
+[dev-dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
