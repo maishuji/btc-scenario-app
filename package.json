@@ -1,0 +1,14 @@
+{
+  "name": "ai-trader-workspace",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c \"bgBlue.bold,bgGreen.bold\" \"npm run dev:api\" \"npm run dev:frontend\"",
+    "dev:api": "cargo run --manifest-path rust/Cargo.toml -p market-intelligence-app -- serve-api",
+    "dev:frontend": "npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173",
+    "build:frontend": "npm --prefix frontend run build",
+    "test:rust": "cargo test --manifest-path rust/Cargo.toml --workspace"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

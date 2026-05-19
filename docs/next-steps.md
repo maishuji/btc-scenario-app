@@ -12,6 +12,9 @@ The Rust workspace now covers the main backend MVP path for a BTC-first scenario
 - Feature, regime, and scenario snapshots are computed and persisted.
 - Basic alerts are generated and persisted when regime or scenario direction changes.
 - The application can read the latest market overview from persistence.
+- A frontend dashboard shell renders market overview, chart context, scenario history, and alerts.
+- Alerts and scenario history can drive chart projections in the frontend.
+- Local development can start the API and frontend together with `npm run dev` from the repo root.
 - The API currently exposes:
   - `GET /api/market-overview`
   - `GET /api/candles?timeframe=1m&limit=...`
@@ -26,34 +29,36 @@ Recent completed commits:
 - `feat: expose market overview endpoint`
 - `feat: expose market history endpoints`
 - `feat: generate alerts from snapshot changes`
+- `feat: add market dashboard shell`
+- `feat: add scenario projection controls`
+- `feat: link alerts to scenario projections`
 
 ## Recommended Next Order
 
 The next work should stay focused on making the system usable by a frontend without widening into new data sources too early.
 
-### 1. Build The First Frontend Shell
+### 1. Add Higher Timeframes
 
 Goal:
 
-- Create a usable dashboard that consumes the existing API.
+- Expand from canonical 1m data into derived user-facing timeframes.
 
 Why next:
 
-- The backend now exposes a minimally useful read surface for an initial UI.
-- Alert reads now return real generated history instead of only seeded rows.
-- Frontend work will quickly expose any remaining API shape issues.
+- The frontend now makes the single-timeframe limitation visible.
+- Higher timeframe context is more valuable than more UI polish on only `1m` data.
+- The backend already has a stable canonical candle path to derive from.
 
 Recommended scope:
 
-- Show current market overview.
-- Render a recent candle chart from `/api/candles`.
-- Render scenario history from `/api/scenario-history`.
-- Render alerts from `/api/alerts`.
+- Derive `5m`, `15m`, and `1h` candles from canonical `1m` data.
+- Expose those timeframes through the existing candle and scenario endpoints.
+- Let the frontend switch between supported timeframes.
 
 Suggested first version:
 
-- Start with a local dashboard shell and simple polling.
-- Keep the visual contract thin until the UI proves what fields are missing.
+- Start with `5m` and `15m` if `1h` widens the slice too much.
+- Keep derivation inside the backend instead of rebuilding candles client-side.
 
 ### 2. Split Runtime Roles If Needed
 
@@ -71,37 +76,38 @@ Possible directions:
 - Separate binaries in the same crate.
 - Separate app crates for ingestion and API.
 
-### 3. Add Higher Timeframes
+### 3. Enrich Alert Metadata
 
-- Expand from canonical 1m data into derived user-facing timeframes.
+Goal:
 
-Why not first:
+- Make alert interactions more explicit and less dependent on timestamp matching.
 
-- The existing backend is still proving the 1m path.
-- Higher timeframe derivation is more valuable after the frontend is visible.
+Why after higher timeframes:
 
-Recommended first additions:
+- The current alert tape is already useful for local iteration.
+- Timeframe expansion will reveal whether alert contracts need extra fields.
 
-- `5m`
-- `15m`
-- `1h`
+Recommended scope:
+
+- Persist explicit linkage to scenario snapshots in API responses.
+- Return richer alert metadata for frontend filtering and chart focus.
 
 ## Suggested Tomorrow Starting Point
 
-If the goal is steady MVP progress, start with the frontend shell.
+If the goal is steady MVP progress, start with higher timeframes.
 
 Concrete next task:
 
-1. Add a frontend workspace or app shell.
-2. Render market overview, candles, scenario history, and alerts.
-3. Wire simple polling against the current API endpoints.
-4. Adjust API response shapes only where the UI reveals real gaps.
-5. Run frontend validation plus `cargo test --workspace`.
+1. Add backend candle derivation for `5m` and `15m`.
+2. Expose those timeframes through the current API surface.
+3. Add a frontend timeframe selector.
+4. Validate with crate-scoped tests, `npm run build`, and `cargo test --workspace`.
 
 ## Relevant Files To Open First Tomorrow
 
 - `rust/crates/persistence-core/src/lib.rs`
 - `rust/crates/market-intelligence-app/src/main.rs`
+- `rust/crates/market-data-core/src/lib.rs`
 - `docs/api-endpoint-matrix.md`
 - `docs/system-architecture.md`
 - `docs/btc-mvp-plan.md`
