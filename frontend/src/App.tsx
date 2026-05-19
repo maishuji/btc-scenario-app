@@ -71,6 +71,14 @@ type DashboardSnapshot = {
   alerts: AlertEntry[]
 }
 
+type ProjectedScenario = {
+  observed_at_ms: number
+  trigger_level: number
+  invalidation_level: number
+  expected_direction: string
+  explanation: string
+}
+
 const pollIntervalMs = 15_000
 const chartWidth = 720
 const chartHeight = 260
@@ -143,16 +151,16 @@ function formatDistanceToLevel(level: number, reference: number) {
   return `${sign}${percent.toFixed(2)}%`
 }
 
-function chartExtents(candles: Candle[], overview: MarketOverview) {
+function chartExtents(candles: Candle[], projectedScenario: ProjectedScenario, spotPrice: number) {
   if (candles.length === 0) {
     return {
-      low: Math.min(overview.invalidation_level, overview.last_price),
-      high: Math.max(overview.trigger_level, overview.last_price),
+      low: Math.min(projectedScenario.invalidation_level, spotPrice),
+      high: Math.max(projectedScenario.trigger_level, spotPrice),
     }
   }
 
   const values = candles.flatMap((candle) => [candle.low, candle.high])
-  values.push(overview.trigger_level, overview.invalidation_level, overview.last_price)
+  values.push(projectedScenario.trigger_level, projectedScenario.invalidation_level, spotPrice)
 
   const low = Math.min(...values)
   const high = Math.max(...values)
@@ -238,6 +246,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshedAtMs, setRefreshedAtMs] = useState<number | null>(null)
+  const [selectedScenarioObservedAtMs, setSelectedScenarioObservedAtMs] = useState<number | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -322,9 +331,21 @@ function App() {
   const { overview, candles, scenarios, alerts } = snapshot
   const bounds = chartBounds(candles)
   const lastCandle = candles[candles.length - 1]
-  const extents = chartExtents(candles, overview)
-  const triggerLineY = scaleChartValue(overview.trigger_level, extents)
-  const invalidationLineY = scaleChartValue(overview.invalidation_level, extents)
+  const selectedScenario = scenarios.find(
+    (scenario) => scenario.observed_at_ms === selectedScenarioObservedAtMs,
+  )
+  const latestScenario = scenarios[scenarios.length - 1]
+  const projectedScenario: ProjectedScenario = selectedScenario ?? latestScenario ?? {
+    observed_at_ms: overview.observed_at_ms,
+    trigger_level: overview.trigger_level,
+    invalidation_level: overview.invalidation_level,
+    expected_direction: overview.expected_direction,
+    explanation: overview.explanation,
+  }
+  const isHistoricalProjection = projectedScenario.observed_at_ms !== overview.observed_at_ms
+  const extents = chartExtents(candles, projectedScenario, overview.last_price)
+  const triggerLineY = scaleChartValue(projectedScenario.trigger_level, extents)
+  const invalidationLineY = scaleChartValue(projectedScenario.invalidation_level, extents)
   const lastPriceLineY = scaleChartValue(overview.last_price, extents)
 
   return (
@@ -418,14 +439,21 @@ function App() {
             </div>
             <div>
               <span className="metric-label">Trigger spread</span>
-              <strong>{formatDistanceToLevel(overview.trigger_level, overview.last_price)}</strong>
+              <strong>{formatDistanceToLevel(projectedScenario.trigger_level, overview.last_price)}</strong>
             </div>
+          </div>
+
+          <div className="projection-banner">
+            <span className={`tag ${directionTone(projectedScenario.expected_direction)}`}>
+              {isHistoricalProjection ? 'Historical projection' : 'Live projection'}
+            </span>
+            <span>{formatTimestamp(projectedScenario.observed_at_ms)}</span>
           </div>
 
           <div className="level-legend">
             <div className="level-legend-item">
               <span className="level-swatch level-swatch-trigger" />
-              <span>Trigger {formatCurrency(overview.trigger_level)}</span>
+              <span>Trigger {formatCurrency(projectedScenario.trigger_level)}</span>
             </div>
             <div className="level-legend-item">
               <span className="level-swatch level-swatch-last" />
@@ -433,7 +461,7 @@ function App() {
             </div>
             <div className="level-legend-item">
               <span className="level-swatch level-swatch-invalidation" />
-              <span>Invalidation {formatCurrency(overview.invalidation_level)}</span>
+              <span>Invalidation {formatCurrency(projectedScenario.invalidation_level)}</span>
             </div>
           </div>
 
@@ -448,13 +476,13 @@ function App() {
             <line x1="0" y1={lastPriceLineY} x2={chartWidth} y2={lastPriceLineY} className="scenario-line scenario-line-last" />
             <line x1="0" y1={invalidationLineY} x2={chartWidth} y2={invalidationLineY} className="scenario-line scenario-line-invalidation" />
             <text x="14" y={Math.max(triggerLineY - 8, 18)} className="scenario-label scenario-label-trigger">
-              Trigger {formatCurrency(overview.trigger_level)}
+              Trigger {formatCurrency(projectedScenario.trigger_level)}
             </text>
             <text x="14" y={Math.max(lastPriceLineY - 8, 18)} className="scenario-label scenario-label-last">
               Spot {formatCurrency(overview.last_price)}
             </text>
             <text x="14" y={Math.max(invalidationLineY - 8, 18)} className="scenario-label scenario-label-invalidation">
-              Invalidation {formatCurrency(overview.invalidation_level)}
+              Invalidation {formatCurrency(projectedScenario.invalidation_level)}
             </text>
             <path d={chartPath(candles, extents)} className="price-line-shadow" />
             <path d={chartPath(candles, extents)} className="price-line" />
@@ -463,13 +491,13 @@ function App() {
           <div className="level-summary-grid">
             <article className="level-summary-card">
               <span className="metric-label">Bias trigger</span>
-              <strong>{formatCurrency(overview.trigger_level)}</strong>
-              <span>{formatDistanceToLevel(overview.trigger_level, overview.last_price)} from spot</span>
+              <strong>{formatCurrency(projectedScenario.trigger_level)}</strong>
+              <span>{formatDistanceToLevel(projectedScenario.trigger_level, overview.last_price)} from spot</span>
             </article>
             <article className="level-summary-card">
               <span className="metric-label">Risk invalidation</span>
-              <strong>{formatCurrency(overview.invalidation_level)}</strong>
-              <span>{formatDistanceToLevel(overview.invalidation_level, overview.last_price)} from spot</span>
+              <strong>{formatCurrency(projectedScenario.invalidation_level)}</strong>
+              <span>{formatDistanceToLevel(projectedScenario.invalidation_level, overview.last_price)} from spot</span>
             </article>
           </div>
         </article>
@@ -527,11 +555,23 @@ function App() {
               <p className="eyebrow">Scenario history</p>
               <h2>Recent directional states</h2>
             </div>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => setSelectedScenarioObservedAtMs(null)}
+            >
+              Follow latest
+            </button>
           </div>
 
           <div className="timeline-list">
             {scenarios.map((scenario) => (
-              <article key={scenario.observed_at_ms} className="timeline-item">
+              <button
+                key={scenario.observed_at_ms}
+                type="button"
+                className={`timeline-item timeline-button${projectedScenario.observed_at_ms === scenario.observed_at_ms ? ' timeline-item-active' : ''}`}
+                onClick={() => setSelectedScenarioObservedAtMs(scenario.observed_at_ms)}
+              >
                 <div className="timeline-meta">
                   <span>{formatTimestamp(scenario.observed_at_ms)}</span>
                   <span className={`tag ${directionTone(scenario.expected_direction)}`}>
@@ -544,7 +584,7 @@ function App() {
                   <span>N {formatProbability(scenario.base_probability)}</span>
                   <span>R {formatProbability(scenario.bear_probability)}</span>
                 </div>
-              </article>
+              </button>
             ))}
           </div>
         </article>
