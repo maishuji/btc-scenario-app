@@ -241,6 +241,13 @@ function severityTone(severity: string) {
   }
 }
 
+function hasMatchingScenario(
+  scenarios: ScenarioHistoryEntry[],
+  triggeredAtMs: number,
+) {
+  return scenarios.some((scenario) => scenario.observed_at_ms === triggeredAtMs)
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null)
   const [isLoading, setIsLoading] = useState(true)
@@ -595,14 +602,28 @@ function App() {
               <p className="eyebrow">Alert tape</p>
               <h2>Latest state transitions</h2>
             </div>
+            <span className="panel-header-meta-inline">Click an alert to project its scenario</span>
           </div>
 
           <div className="timeline-list">
             {alerts.length === 0 ? (
               <p className="empty-state">No alerts have been generated yet.</p>
             ) : (
-              alerts.map((alert) => (
-                <article key={`${alert.alert_type}-${alert.triggered_at_ms}`} className="timeline-item">
+              alerts.map((alert) => {
+                const canProjectScenario = hasMatchingScenario(scenarios, alert.triggered_at_ms)
+
+                return (
+                <button
+                  key={`${alert.alert_type}-${alert.triggered_at_ms}`}
+                  type="button"
+                  className={`timeline-item timeline-button${projectedScenario.observed_at_ms === alert.triggered_at_ms ? ' timeline-item-active' : ''}${!canProjectScenario ? ' timeline-item-muted' : ''}`}
+                  onClick={() => {
+                    if (canProjectScenario) {
+                      setSelectedScenarioObservedAtMs(alert.triggered_at_ms)
+                    }
+                  }}
+                  disabled={!canProjectScenario}
+                >
                   <div className="timeline-meta">
                     <span>{formatTimestamp(alert.triggered_at_ms)}</span>
                     <span className={`tag ${severityTone(alert.severity)}`}>{alert.severity}</span>
@@ -610,10 +631,18 @@ function App() {
                   <p>{alert.message}</p>
                   <div className="timeline-probabilities">
                     <span>{alert.alert_type.replace(/_/g, ' ')}</span>
-                    <span>{alert.is_acknowledged ? 'acknowledged' : 'open'}</span>
+                    <span>
+                      {canProjectScenario
+                        ? projectedScenario.observed_at_ms === alert.triggered_at_ms
+                          ? 'projected'
+                          : 'focus chart'
+                        : alert.is_acknowledged
+                          ? 'acknowledged'
+                          : 'open'}
+                    </span>
                   </div>
-                </article>
-              ))
+                </button>
+              )})
             )}
           </div>
         </article>
