@@ -220,6 +220,8 @@ Useful feature fields:
 - volume_confirmation_score
 - support_distance
 - resistance_distance
+- support_level
+- resistance_level
 
 Useful scenario fields:
 

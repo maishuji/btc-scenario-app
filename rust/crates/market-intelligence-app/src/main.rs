@@ -72,6 +72,8 @@ mod api {
         pub momentum_score: f64,
         pub volatility_score: f64,
         pub volume_confirmation_score: f64,
+        pub support_level: f64,
+        pub resistance_level: f64,
         pub support_distance: f64,
         pub resistance_distance: f64,
         pub level_reaction_score: f64,
@@ -99,6 +101,8 @@ mod api {
                 momentum_score: record.feature_snapshot.momentum_score,
                 volatility_score: record.feature_snapshot.volatility_score,
                 volume_confirmation_score: record.feature_snapshot.volume_confirmation_score,
+                support_level: record.feature_snapshot.support_level,
+                resistance_level: record.feature_snapshot.resistance_level,
                 support_distance: record.feature_snapshot.support_distance,
                 resistance_distance: record.feature_snapshot.resistance_distance,
                 level_reaction_score: record.feature_snapshot.level_reaction_score,
@@ -416,42 +420,42 @@ mod tasks {
         ) -> Vec<AlertRecord> {
             let mut alerts = Vec::new();
 
-            if let Some(previous_regime) = previous_regime {
-                if previous_regime.regime_label != current_regime.regime_label {
-                    alerts.push(AlertRecord {
-                        instrument_id: current_regime.instrument_id.clone(),
-                        timeframe: current_regime.timeframe,
-                        alert_type: "regime_changed".to_owned(),
-                        severity: regime_change_severity(current_regime.regime_label).to_owned(),
-                        message: format!(
-                            "Regime changed from {} to {}",
-                            regime_label_as_str(previous_regime.regime_label),
-                            regime_label_as_str(current_regime.regime_label),
-                        ),
-                        triggered_at_ms: current_regime.observed_at.0,
-                        scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
-                        is_acknowledged: false,
-                    });
-                }
+            if let Some(previous_regime) = previous_regime
+                && previous_regime.regime_label != current_regime.regime_label
+            {
+                alerts.push(AlertRecord {
+                    instrument_id: current_regime.instrument_id.clone(),
+                    timeframe: current_regime.timeframe,
+                    alert_type: "regime_changed".to_owned(),
+                    severity: regime_change_severity(current_regime.regime_label).to_owned(),
+                    message: format!(
+                        "Regime changed from {} to {}",
+                        regime_label_as_str(previous_regime.regime_label),
+                        regime_label_as_str(current_regime.regime_label),
+                    ),
+                    triggered_at_ms: current_regime.observed_at.0,
+                    scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
+                    is_acknowledged: false,
+                });
             }
 
-            if let Some(previous_scenario) = previous_scenario {
-                if previous_scenario.expected_direction != current_scenario.expected_direction {
-                    alerts.push(AlertRecord {
-                        instrument_id: current_scenario.instrument_id.clone(),
-                        timeframe: current_scenario.timeframe,
-                        alert_type: "scenario_shifted".to_owned(),
-                        severity: "warning".to_owned(),
-                        message: format!(
-                            "Scenario direction shifted from {} to {}",
-                            expected_direction_as_str(previous_scenario.expected_direction),
-                            expected_direction_as_str(current_scenario.expected_direction),
-                        ),
-                        triggered_at_ms: current_scenario.observed_at.0,
-                        scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
-                        is_acknowledged: false,
-                    });
-                }
+            if let Some(previous_scenario) = previous_scenario
+                && previous_scenario.expected_direction != current_scenario.expected_direction
+            {
+                alerts.push(AlertRecord {
+                    instrument_id: current_scenario.instrument_id.clone(),
+                    timeframe: current_scenario.timeframe,
+                    alert_type: "scenario_shifted".to_owned(),
+                    severity: "warning".to_owned(),
+                    message: format!(
+                        "Scenario direction shifted from {} to {}",
+                        expected_direction_as_str(previous_scenario.expected_direction),
+                        expected_direction_as_str(current_scenario.expected_direction),
+                    ),
+                    triggered_at_ms: current_scenario.observed_at.0,
+                    scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
+                    is_acknowledged: false,
+                });
             }
 
             alerts
@@ -1082,6 +1086,10 @@ mod tests {
         assert_eq!(response.0.instrument_id, "BTC-USD-SPOT");
         assert_eq!(response.0.timeframe, "1m");
         assert_eq!(response.0.last_price, 68_500.0);
+        assert_eq!(response.0.support_level, 67_950.0);
+        assert_eq!(response.0.resistance_level, 68_600.0);
+        assert_eq!(response.0.trigger_level, 68_600.0);
+        assert_eq!(response.0.invalidation_level, 67_950.0);
         assert_eq!(response.0.regime_label, "uptrend");
         assert_eq!(response.0.expected_direction, "bullish");
 

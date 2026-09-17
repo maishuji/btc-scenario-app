@@ -169,6 +169,8 @@ Suggested columns:
 - `momentum_score`
 - `volatility_score`
 - `volume_confirmation_score`
+- `support_level`
+- `resistance_level`
 - `support_distance`
 - `resistance_distance`
 - `level_reaction_score`

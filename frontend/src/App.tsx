@@ -12,6 +12,8 @@ type MarketOverview = {
   momentum_score: number
   volatility_score: number
   volume_confirmation_score: number
+  support_level: number
+  resistance_level: number
   support_distance: number
   resistance_distance: number
   level_reaction_score: number
@@ -153,16 +155,28 @@ function formatDistanceToLevel(level: number, reference: number) {
   return `${sign}${percent.toFixed(2)}%`
 }
 
-function chartExtents(candles: Candle[], projectedScenario: ProjectedScenario, spotPrice: number) {
+function chartExtents(
+  candles: Candle[],
+  projectedScenario: ProjectedScenario,
+  spotPrice: number,
+  supportLevel: number,
+  resistanceLevel: number,
+) {
   if (candles.length === 0) {
     return {
-      low: Math.min(projectedScenario.invalidation_level, spotPrice),
-      high: Math.max(projectedScenario.trigger_level, spotPrice),
+      low: Math.min(projectedScenario.invalidation_level, supportLevel, spotPrice),
+      high: Math.max(projectedScenario.trigger_level, resistanceLevel, spotPrice),
     }
   }
 
   const values = candles.flatMap((candle) => [candle.low, candle.high])
-  values.push(projectedScenario.trigger_level, projectedScenario.invalidation_level, spotPrice)
+  values.push(
+    projectedScenario.trigger_level,
+    projectedScenario.invalidation_level,
+    supportLevel,
+    resistanceLevel,
+    spotPrice,
+  )
 
   const low = Math.min(...values)
   const high = Math.max(...values)
@@ -358,7 +372,15 @@ function App() {
     explanation: overview.explanation,
   }
   const isHistoricalProjection = projectedScenario.observed_at_ms !== overview.observed_at_ms
-  const extents = chartExtents(candles, projectedScenario, overview.last_price)
+  const extents = chartExtents(
+    candles,
+    projectedScenario,
+    overview.last_price,
+    overview.support_level,
+    overview.resistance_level,
+  )
+  const supportLineY = scaleChartValue(overview.support_level, extents)
+  const resistanceLineY = scaleChartValue(overview.resistance_level, extents)
   const triggerLineY = scaleChartValue(projectedScenario.trigger_level, extents)
   const invalidationLineY = scaleChartValue(projectedScenario.invalidation_level, extents)
   const lastPriceLineY = scaleChartValue(overview.last_price, extents)
@@ -483,6 +505,14 @@ function App() {
 
           <div className="level-legend">
             <div className="level-legend-item">
+              <span className="level-swatch level-swatch-support" />
+              <span>Support {formatCurrency(overview.support_level)}</span>
+            </div>
+            <div className="level-legend-item">
+              <span className="level-swatch level-swatch-resistance" />
+              <span>Resistance {formatCurrency(overview.resistance_level)}</span>
+            </div>
+            <div className="level-legend-item">
               <span className="level-swatch level-swatch-trigger" />
               <span>Trigger {formatCurrency(projectedScenario.trigger_level)}</span>
             </div>
@@ -503,9 +533,17 @@ function App() {
                 <stop offset="100%" stopColor="rgba(255, 122, 24, 0.05)" />
               </linearGradient>
             </defs>
+            <line x1="0" y1={supportLineY} x2={chartWidth} y2={supportLineY} className="scenario-line scenario-line-support" />
+            <line x1="0" y1={resistanceLineY} x2={chartWidth} y2={resistanceLineY} className="scenario-line scenario-line-resistance" />
             <line x1="0" y1={triggerLineY} x2={chartWidth} y2={triggerLineY} className="scenario-line scenario-line-trigger" />
             <line x1="0" y1={lastPriceLineY} x2={chartWidth} y2={lastPriceLineY} className="scenario-line scenario-line-last" />
             <line x1="0" y1={invalidationLineY} x2={chartWidth} y2={invalidationLineY} className="scenario-line scenario-line-invalidation" />
+            <text x="14" y={Math.max(supportLineY - 8, 18)} className="scenario-label scenario-label-support">
+              Support {formatCurrency(overview.support_level)}
+            </text>
+            <text x="14" y={Math.max(resistanceLineY - 8, 18)} className="scenario-label scenario-label-resistance">
+              Resistance {formatCurrency(overview.resistance_level)}
+            </text>
             <text x="14" y={Math.max(triggerLineY - 8, 18)} className="scenario-label scenario-label-trigger">
               Trigger {formatCurrency(projectedScenario.trigger_level)}
             </text>
@@ -520,6 +558,16 @@ function App() {
           </svg>
 
           <div className="level-summary-grid">
+            <article className="level-summary-card">
+              <span className="metric-label">Support level</span>
+              <strong>{formatCurrency(overview.support_level)}</strong>
+              <span>{formatDistanceToLevel(overview.support_level, overview.last_price)} from spot</span>
+            </article>
+            <article className="level-summary-card">
+              <span className="metric-label">Resistance level</span>
+              <strong>{formatCurrency(overview.resistance_level)}</strong>
+              <span>{formatDistanceToLevel(overview.resistance_level, overview.last_price)} from spot</span>
+            </article>
             <article className="level-summary-card">
               <span className="metric-label">Bias trigger</span>
               <strong>{formatCurrency(projectedScenario.trigger_level)}</strong>
@@ -570,12 +618,12 @@ function App() {
 
           <dl className="detail-grid">
             <div>
-              <dt>Support distance</dt>
-              <dd>{formatCurrency(overview.support_distance)}</dd>
+              <dt>Support level</dt>
+              <dd>{formatCurrency(overview.support_level)}</dd>
             </div>
             <div>
-              <dt>Resistance distance</dt>
-              <dd>{formatCurrency(overview.resistance_distance)}</dd>
+              <dt>Resistance level</dt>
+              <dd>{formatCurrency(overview.resistance_level)}</dd>
             </div>
           </dl>
         </article>
