@@ -82,6 +82,8 @@ type ProjectedScenario = {
 const pollIntervalMs = 15_000
 const chartWidth = 720
 const chartHeight = 260
+const timeframeOptions = ['1m', '5m', '15m', '1h', '4h', '1d', '1w'] as const
+type Timeframe = (typeof timeframeOptions)[number]
 
 const currencyFormatter = new Intl.NumberFormat('en-US', {
   style: 'currency',
@@ -254,10 +256,12 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [refreshedAtMs, setRefreshedAtMs] = useState<number | null>(null)
   const [selectedScenarioObservedAtMs, setSelectedScenarioObservedAtMs] = useState<number | null>(null)
+  const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>('1m')
 
   useEffect(() => {
     let cancelled = false
     let isFirstLoad = true
+    const timeframeQuery = new URLSearchParams({ timeframe: selectedTimeframe })
 
     const hydrate = async () => {
       if (isFirstLoad) {
@@ -266,10 +270,10 @@ function App() {
 
       try {
         const [overview, candles, scenarios, alerts] = await Promise.all([
-          loadJson<MarketOverview>('/api/market-overview'),
-          loadJson<Candle[]>('/api/candles?timeframe=1m&limit=48'),
-          loadJson<ScenarioHistoryEntry[]>('/api/scenario-history?timeframe=1m&limit=6'),
-          loadJson<AlertEntry[]>('/api/alerts?timeframe=1m&limit=6'),
+          loadJson<MarketOverview>(`/api/market-overview?${timeframeQuery}`),
+          loadJson<Candle[]>(`/api/candles?${timeframeQuery}&limit=48`),
+          loadJson<ScenarioHistoryEntry[]>(`/api/scenario-history?${timeframeQuery}&limit=6`),
+          loadJson<AlertEntry[]>(`/api/alerts?${timeframeQuery}&limit=6`),
         ])
 
         if (cancelled) {
@@ -307,7 +311,11 @@ function App() {
       cancelled = true
       window.clearInterval(intervalId)
     }
-  }, [])
+  }, [selectedTimeframe])
+
+  useEffect(() => {
+    setSelectedScenarioObservedAtMs(null)
+  }, [selectedTimeframe])
 
   if (isLoading && !snapshot) {
     return (
@@ -360,7 +368,7 @@ function App() {
       <section className="hero-panel panel">
         <div className="hero-copy">
           <p className="eyebrow">BTC Scenario Terminal</p>
-          <h1>Live regime, scenario, and alert posture for the canonical 1m feed.</h1>
+          <h1>Live regime, scenario, and alert posture across BTC timeframes.</h1>
           <p className="hero-summary">{overview.explanation}</p>
           <div className="hero-tags">
             <span className={`tag ${regimeTone(overview.regime_label)}`}>
@@ -369,7 +377,23 @@ function App() {
             <span className={`tag ${directionTone(overview.expected_direction)}`}>
               Bias {overview.expected_direction}
             </span>
-            <span className="tag tone-neutral">Feed {overview.timeframe}</span>
+            <span className="tag tone-neutral">View {overview.timeframe}</span>
+          </div>
+          <div className="timeframe-control">
+            <span className="metric-label">Analysis timeframe</span>
+            <div className="timeframe-options" role="group" aria-label="Analysis timeframe">
+              {timeframeOptions.map((timeframe) => (
+                <button
+                  key={timeframe}
+                  type="button"
+                  className={`timeframe-button${selectedTimeframe === timeframe ? ' timeframe-button-active' : ''}`}
+                  onClick={() => setSelectedTimeframe(timeframe)}
+                  aria-pressed={selectedTimeframe === timeframe}
+                >
+                  {timeframe}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

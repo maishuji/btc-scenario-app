@@ -82,6 +82,33 @@
   flex-wrap: wrap;
 }
 
+.timeframe-control {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.timeframe-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.timeframe-button {
+  min-width: 3rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(237, 242, 245, 0.78);
+  font-size: 0.78rem;
+}
+
+.timeframe-button-active {
+  border-color: rgba(255, 122, 24, 0.65);
+  background: rgba(255, 122, 24, 0.16);
+  color: #ffcf8c;
+}
+
 .panel-inset,
 .stat-panel,
 .chart-panel,
