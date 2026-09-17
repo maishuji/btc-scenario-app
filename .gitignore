@@ -2,3 +2,5 @@
 /rust/var/
 /node_modules/
 /frontend/node_modules/
+/var/
+.private/

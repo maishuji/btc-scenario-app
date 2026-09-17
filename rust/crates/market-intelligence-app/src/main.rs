@@ -6,6 +6,7 @@ mod config {
         pub market_data_db_path: String,
         pub api_bind_address: String,
         pub live_sync_message_limit: usize,
+        pub api_sync_interval_secs: u64,
     }
 
     impl Default for AppConfig {
@@ -16,6 +17,7 @@ mod config {
                 market_data_db_path: "var/market-data.sqlite3".to_owned(),
                 api_bind_address: "127.0.0.1:3000".to_owned(),
                 live_sync_message_limit: 2,
+                api_sync_interval_secs: 30,
             }
         }
     }
@@ -220,6 +222,12 @@ mod api {
     }
 
     pub async fn serve(config: &AppConfig) -> Result<(), String> {
+        if let Err(error) = crate::runtime::run_sync_cycle(config).await {
+            eprintln!("initial market data sync failed: {error}");
+        }
+
+        crate::runtime::spawn_periodic_sync(config.clone());
+
         let state = ApiState::from_config(config);
         let router = build_router(state);
         let listener = tokio::net::TcpListener::bind(&config.api_bind_address)
@@ -678,6 +686,8 @@ mod tasks {
 }
 
 mod runtime {
+    use std::time::Duration;
+
     use crate::config::AppConfig;
     use crate::tasks::{open_market_data_store, BinanceBootstrapIngestionTask, BinanceLiveSyncTask, IngestionSummary, LiveSyncSummary};
 
@@ -704,6 +714,30 @@ mod runtime {
                 live_sync,
             })
         }
+    }
+
+    pub async fn run_sync_cycle(config: &AppConfig) -> Result<RuntimeSummary, String> {
+        let config = config.clone();
+
+        tokio::task::spawn_blocking(move || Runtime { config }.run())
+            .await
+            .map_err(|error| format!("market data sync task failed: {error}"))?
+    }
+
+    pub fn spawn_periodic_sync(config: AppConfig) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(config.api_sync_interval_secs));
+
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                if let Err(error) = run_sync_cycle(&config).await {
+                    eprintln!("periodic market data sync failed: {error}");
+                }
+            }
+        });
     }
 }
 

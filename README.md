@@ -23,6 +23,7 @@ This starts:
 - the Vite frontend on `http://127.0.0.1:5173`
 
 The frontend proxies `/api` requests to the Rust API on `http://127.0.0.1:3000`.
+The API now performs an initial Binance sync at startup and continues refreshing the local SQLite store in the background while it serves requests.
 
 ### Useful root commands
 
