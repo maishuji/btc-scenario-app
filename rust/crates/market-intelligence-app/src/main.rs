@@ -241,13 +241,12 @@ mod api {
 
     pub async fn get_market_overview(
         State(state): State<ApiState>,
+        Query(params): Query<ApiListQuery>,
     ) -> Result<Json<MarketOverviewResponse>, StatusCode> {
         let store = open_store(&state)?;
+        let timeframe = parse_timeframe(params.timeframe.as_deref())?;
 
-        let query = LatestMarketOverviewQuery::for_instrument(
-            state.instrument_id,
-            Timeframe::OneMinute,
-        );
+        let query = LatestMarketOverviewQuery::for_instrument(state.instrument_id, timeframe);
         let overview = MarketOverviewQueryService
             .load_latest(&store, &query)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -371,6 +370,7 @@ mod tasks {
     };
     use persistence_core::sqlite::SqliteMarketDataStore;
     use scenario_core::{
+        aggregation::TimeframeDerivationEngine,
         ExpectedDirection,
         FeatureSnapshotBuilder,
         MarketRegimeLabel,
@@ -492,6 +492,30 @@ mod tasks {
 
             Ok(3)
         }
+
+        pub fn persist_timeframe_views(
+            self,
+            store: &SqliteMarketDataStore,
+            one_minute_candles: &[market_data_core::candle::Candle],
+        ) -> Result<usize, String> {
+            let derivation_engine = TimeframeDerivationEngine;
+            let mut persisted_analytics_count = 0;
+
+            for timeframe in derivation_engine.default_targets() {
+                let candles = derivation_engine.derive(one_minute_candles, timeframe);
+                if candles.is_empty() {
+                    continue;
+                }
+
+                for candle in &candles {
+                    CandleRepository::save(store, candle).map_err(|error| error.to_string())?;
+                }
+
+                persisted_analytics_count += self.compute_and_persist(store, &candles)?;
+            }
+
+            Ok(persisted_analytics_count)
+        }
     }
 
     fn scenario_snapshot_identifier(snapshot: &scenario_core::ScenarioSnapshot) -> String {
@@ -573,7 +597,8 @@ mod tasks {
 
             LivePriceSnapshotRepository::save(store, &snapshot).map_err(|error| error.to_string())?;
             let persisted_analytics_count = AnalyticsSnapshotPipeline
-                .compute_and_persist(store, &candles)?;
+                .compute_and_persist(store, &candles)?
+                + AnalyticsSnapshotPipeline.persist_timeframe_views(store, &candles)?;
             let latest_market_overview = MarketOverviewReadTask
                 .load_latest(store, &instrument, Timeframe::OneMinute)?;
 
@@ -642,7 +667,9 @@ mod tasks {
                 let candles = store
                     .load_recent_candles(&instrument.id, Timeframe::OneMinute, 120)
                     .map_err(|error| error.to_string())?;
-                AnalyticsSnapshotPipeline.compute_and_persist(store, &candles)?
+                AnalyticsSnapshotPipeline
+                    .compute_and_persist(store, &candles)?
+                    + AnalyticsSnapshotPipeline.persist_timeframe_views(store, &candles)?
             };
             let latest_market_overview = MarketOverviewReadTask
                 .load_latest(store, &instrument, Timeframe::OneMinute)?;
@@ -851,7 +878,7 @@ mod tests {
 
         assert_eq!(summary.persisted_candle_count, 2);
         assert_eq!(summary.snapshot_observed_at_ms, 1_710_000_120_000);
-        assert_eq!(summary.persisted_analytics_count, 3);
+        assert_eq!(summary.persisted_analytics_count, 21);
         assert_eq!(
             summary
                 .latest_market_overview
@@ -863,11 +890,11 @@ mod tests {
             summary.websocket_stream_url,
             "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/btcusdt@miniTicker"
         );
-        assert_eq!(store.count_rows("candles").unwrap(), 2);
+        assert_eq!(store.count_rows("candles").unwrap(), 8);
         assert_eq!(store.count_rows("live_price_snapshots").unwrap(), 1);
-        assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
-        assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
-        assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("feature_snapshots").unwrap(), 7);
+        assert_eq!(store.count_rows("regime_snapshots").unwrap(), 7);
+        assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 7);
     }
 
     #[test]
@@ -923,7 +950,7 @@ mod tests {
         assert_eq!(summary.processed_message_count, 2);
         assert_eq!(summary.persisted_candle_update_count, 1);
         assert_eq!(summary.persisted_snapshot_update_count, 1);
-        assert_eq!(summary.persisted_analytics_count, 3);
+        assert_eq!(summary.persisted_analytics_count, 21);
         assert_eq!(
             summary
                 .latest_market_overview
@@ -931,11 +958,11 @@ mod tests {
                 .map(|overview| overview.scenario_snapshot.expected_direction),
             Some(ExpectedDirection::Bullish)
         );
-        assert_eq!(store.count_rows("candles").unwrap(), 1);
+        assert_eq!(store.count_rows("candles").unwrap(), 7);
         assert_eq!(store.count_rows("live_price_snapshots").unwrap(), 1);
-        assert_eq!(store.count_rows("feature_snapshots").unwrap(), 1);
-        assert_eq!(store.count_rows("regime_snapshots").unwrap(), 1);
-        assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 1);
+        assert_eq!(store.count_rows("feature_snapshots").unwrap(), 7);
+        assert_eq!(store.count_rows("regime_snapshots").unwrap(), 7);
+        assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 7);
     }
 
     #[test]
@@ -987,7 +1014,7 @@ mod tests {
             )
             .expect("bootstrap ingestion should succeed");
 
-        assert_eq!(summary.persisted_analytics_count, 3);
+        assert_eq!(summary.persisted_analytics_count, 21);
         let observed_at_ms = summary
             .latest_market_overview
             .as_ref()
@@ -1042,8 +1069,14 @@ mod tests {
             )
             .expect("bootstrap ingestion should succeed");
 
-        let response = get_market_overview(State(ApiState::from_config(&config)))
-            .await
+        let response = get_market_overview(
+            State(ApiState::from_config(&config)),
+            Query(ApiListQuery {
+                timeframe: None,
+                limit: None,
+            }),
+        )
+        .await
             .expect("api handler should return market overview");
 
         assert_eq!(response.0.instrument_id, "BTC-USD-SPOT");
@@ -1051,6 +1084,18 @@ mod tests {
         assert_eq!(response.0.last_price, 68_500.0);
         assert_eq!(response.0.regime_label, "uptrend");
         assert_eq!(response.0.expected_direction, "bullish");
+
+        let higher_timeframe_response = get_market_overview(
+            State(ApiState::from_config(&config)),
+            Query(ApiListQuery {
+                timeframe: Some("5m".to_owned()),
+                limit: None,
+            }),
+        )
+        .await
+        .expect("api handler should return higher timeframe market overview");
+
+        assert_eq!(higher_timeframe_response.0.timeframe, "5m");
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -1096,6 +1141,21 @@ mod tests {
         assert_eq!(response.0.len(), 2);
         assert_eq!(response.0[0].open_time_ms, 1_710_000_000_000);
         assert_eq!(response.0[1].close, 68_500.0);
+
+        let higher_timeframe_response = get_candles(
+            State(ApiState::from_config(&config)),
+            Query(ApiListQuery {
+                timeframe: Some("5m".to_owned()),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("api handler should return higher timeframe candles");
+
+        assert_eq!(higher_timeframe_response.0.len(), 1);
+        assert_eq!(higher_timeframe_response.0[0].timeframe, "5m");
+        assert_eq!(higher_timeframe_response.0[0].open, 68_000.0);
+        assert_eq!(higher_timeframe_response.0[0].close, 68_500.0);
 
         let _ = std::fs::remove_file(db_path);
     }

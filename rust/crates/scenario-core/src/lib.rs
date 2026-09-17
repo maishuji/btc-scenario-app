@@ -44,19 +44,24 @@ pub mod aggregation {
             sorted_candles.sort_by_key(|candle| candle.open_time.0);
 
             let mut derived_candles: Vec<Candle> = Vec::new();
+            let mut current_bucket_count = 0_usize;
+            let mut current_bucket_all_final = false;
 
             for candle in sorted_candles {
                 let bucket_open_time_ms = (candle.open_time.0 / bucket_size_ms) * bucket_size_ms;
 
                 if let Some(current) = derived_candles.last_mut() {
                     if current.open_time.0 == bucket_open_time_ms {
+                        current_bucket_count += 1;
+                        current_bucket_all_final &= candle.is_final;
                         current.high.0 = current.high.0.max(candle.high.0);
                         current.low.0 = current.low.0.min(candle.low.0);
                         current.close = candle.close;
                         current.close_time = candle.close_time;
                         current.volume.0 += candle.volume.0;
                         current.trade_count += candle.trade_count;
-                        current.is_final &= candle.is_final;
+                        current.is_final = current_bucket_count == target.minutes() as usize
+                            && current_bucket_all_final;
                         continue;
                     }
                 }
@@ -64,7 +69,9 @@ pub mod aggregation {
                 let mut derived = candle;
                 derived.timeframe = target;
                 derived.open_time.0 = bucket_open_time_ms;
-                derived.close_time.0 = derived.open_time.0 + bucket_size_ms - 1;
+                current_bucket_all_final = derived.is_final;
+                derived.is_final = false;
+                current_bucket_count = 1;
                 derived_candles.push(derived);
             }
 
@@ -447,6 +454,18 @@ mod tests {
         assert!(!derived[0].is_final);
         assert_eq!(derived[1].open_time.0, 300_000);
         assert_eq!(derived[1].close.0, 106.0);
+        assert!(!derived[1].is_final);
+
+        let complete_candles = candles
+            .iter()
+            .cloned()
+            .map(|mut candle| {
+                candle.is_final = true;
+                candle
+            })
+            .collect::<Vec<_>>();
+        let complete = TimeframeDerivationEngine.derive(&complete_candles, Timeframe::FiveMinutes);
+        assert!(complete[0].is_final);
     }
 
     #[test]
