@@ -50,20 +50,20 @@ pub mod aggregation {
             for candle in sorted_candles {
                 let bucket_open_time_ms = (candle.open_time.0 / bucket_size_ms) * bucket_size_ms;
 
-                if let Some(current) = derived_candles.last_mut() {
-                    if current.open_time.0 == bucket_open_time_ms {
-                        current_bucket_count += 1;
-                        current_bucket_all_final &= candle.is_final;
-                        current.high.0 = current.high.0.max(candle.high.0);
-                        current.low.0 = current.low.0.min(candle.low.0);
-                        current.close = candle.close;
-                        current.close_time = candle.close_time;
-                        current.volume.0 += candle.volume.0;
-                        current.trade_count += candle.trade_count;
-                        current.is_final = current_bucket_count == target.minutes() as usize
-                            && current_bucket_all_final;
-                        continue;
-                    }
+                if let Some(current) = derived_candles.last_mut()
+                    && current.open_time.0 == bucket_open_time_ms
+                {
+                    current_bucket_count += 1;
+                    current_bucket_all_final &= candle.is_final;
+                    current.high.0 = current.high.0.max(candle.high.0);
+                    current.low.0 = current.low.0.min(candle.low.0);
+                    current.close = candle.close;
+                    current.close_time = candle.close_time;
+                    current.volume.0 += candle.volume.0;
+                    current.trade_count += candle.trade_count;
+                    current.is_final = current_bucket_count == target.minutes() as usize
+                        && current_bucket_all_final;
+                    continue;
                 }
 
                 let mut derived = candle;
@@ -101,6 +101,8 @@ pub mod features {
         pub momentum_score: f64,
         pub volatility_score: f64,
         pub volume_confirmation_score: f64,
+        pub support_level: f64,
+        pub resistance_level: f64,
         pub support_distance: f64,
         pub resistance_distance: f64,
         pub level_reaction_score: f64,
@@ -194,6 +196,8 @@ pub mod features {
                 momentum_score: momentum_strategy.compute(candles),
                 volatility_score: volatility_strategy.compute(candles),
                 volume_confirmation_score: last.volume.0 - first.volume.0,
+                support_level: support,
+                resistance_level: resistance,
                 support_distance: (last.close.0 - support).max(0.0),
                 resistance_distance: (resistance - last.close.0).max(0.0),
                 level_reaction_score: resistance - support,
@@ -313,8 +317,8 @@ pub mod scenario {
                 bull_probability,
                 base_probability,
                 bear_probability,
-                trigger_level: feature_snapshot.resistance_distance,
-                invalidation_level: feature_snapshot.support_distance,
+                trigger_level: feature_snapshot.resistance_level,
+                invalidation_level: feature_snapshot.support_level,
                 expected_direction,
                 explanation,
             }
@@ -375,16 +379,7 @@ mod tests {
     use market_data_core::value_objects::{Price, Timestamp, Volume};
 
     fn build_candle(open: f64, high: f64, low: f64, close: f64, close_time: i64) -> Candle {
-        build_candle_with_stats(
-            close_time - 60_000,
-            open,
-            high,
-            low,
-            close,
-            100.0,
-            10,
-            true,
-        )
+        build_candle_with_stats(close_time - 60_000, open, high, low, close, 100.0, 10)
     }
 
     fn build_candle_with_stats(
@@ -395,7 +390,6 @@ mod tests {
         close: f64,
         volume: f64,
         trade_count: u64,
-        is_final: bool,
     ) -> Candle {
         Candle {
             instrument_id: "BTC-USD-SPOT".to_owned(),
@@ -409,7 +403,7 @@ mod tests {
             close: Price::new(close).unwrap(),
             volume: Volume::new(volume).unwrap(),
             trade_count,
-            is_final,
+            is_final: true,
         }
     }
 
@@ -420,24 +414,29 @@ mod tests {
             build_candle(100_500.0, 102_000.0, 100_000.0, 101_500.0, 120_000),
         ];
         let feature_snapshot = FeatureSnapshotBuilder.build(&candles).unwrap();
+        assert_eq!(feature_snapshot.support_level, 99_500.0);
+        assert_eq!(feature_snapshot.resistance_level, 102_000.0);
         let regime_snapshot = MarketRegimeStrategy.classify(&feature_snapshot);
         let explanation = ScenarioExplanationBuilder.build(&feature_snapshot, &regime_snapshot);
         let scenario = ScenarioScoringStrategy.score(&feature_snapshot, &regime_snapshot, explanation);
 
         let probability_sum = scenario.bull_probability + scenario.base_probability + scenario.bear_probability;
         assert!((probability_sum - 1.0).abs() < f64::EPSILON);
+        assert_eq!(scenario.trigger_level, 102_000.0);
+        assert_eq!(scenario.invalidation_level, 99_500.0);
     }
 
     #[test]
     fn derives_sorted_five_minute_ohlcv_candles() {
-        let candles = vec![
-            build_candle_with_stats(240_000, 104.0, 106.0, 103.0, 105.0, 4.0, 40, true),
-            build_candle_with_stats(60_000, 101.0, 103.0, 100.0, 102.0, 2.0, 20, true),
-            build_candle_with_stats(0, 100.0, 102.0, 99.0, 101.0, 1.0, 10, true),
-            build_candle_with_stats(180_000, 103.0, 105.0, 102.0, 104.0, 3.0, 30, true),
-            build_candle_with_stats(120_000, 102.0, 104.0, 101.0, 103.0, 2.5, 25, false),
-            build_candle_with_stats(300_000, 105.0, 107.0, 104.0, 106.0, 5.0, 50, true),
+        let mut candles = vec![
+            build_candle_with_stats(240_000, 104.0, 106.0, 103.0, 105.0, 4.0, 40),
+            build_candle_with_stats(60_000, 101.0, 103.0, 100.0, 102.0, 2.0, 20),
+            build_candle_with_stats(0, 100.0, 102.0, 99.0, 101.0, 1.0, 10),
+            build_candle_with_stats(180_000, 103.0, 105.0, 102.0, 104.0, 3.0, 30),
+            build_candle_with_stats(120_000, 102.0, 104.0, 101.0, 103.0, 2.5, 25),
+            build_candle_with_stats(300_000, 105.0, 107.0, 104.0, 106.0, 5.0, 50),
         ];
+        candles[4].is_final = false;
 
         let derived = TimeframeDerivationEngine.derive(&candles, Timeframe::FiveMinutes);
 

@@ -218,6 +218,14 @@
   background: #ffc857;
 }
 
+.level-swatch-support {
+  background: #67d6c0;
+}
+
+.level-swatch-resistance {
+  background: #9e9cff;
+}
+
 .level-swatch-last {
   background: #ff7a18;
 }
@@ -292,6 +300,14 @@
   stroke: rgba(255, 200, 87, 0.9);
 }
 
+.scenario-line-support {
+  stroke: rgba(103, 214, 192, 0.9);
+}
+
+.scenario-line-resistance {
+  stroke: rgba(158, 156, 255, 0.9);
+}
+
 .scenario-line-last {
   stroke: rgba(255, 122, 24, 0.9);
 }
@@ -307,6 +323,14 @@
 
 .scenario-label-trigger {
   fill: #ffe3a0;
+}
+
+.scenario-label-support {
+  fill: #a9f2e3;
+}
+
+.scenario-label-resistance {
+  fill: #c6c5ff;
 }
 
 .scenario-label-last {

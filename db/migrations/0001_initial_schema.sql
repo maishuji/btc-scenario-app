@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     momentum_score REAL NOT NULL,
     volatility_score REAL NOT NULL,
     volume_confirmation_score REAL NOT NULL,
+    support_level REAL NOT NULL DEFAULT 0.0,
+    resistance_level REAL NOT NULL DEFAULT 0.0,
     support_distance REAL NOT NULL,
     resistance_distance REAL NOT NULL,
     level_reaction_score REAL NOT NULL,

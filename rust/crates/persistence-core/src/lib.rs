@@ -186,7 +186,34 @@ pub mod sqlite {
         }
 
         pub fn apply_migrations(&self) -> Result<(), rusqlite::Error> {
-            self.connection.borrow().execute_batch(INITIAL_MIGRATION)
+            self.connection.borrow().execute_batch(INITIAL_MIGRATION)?;
+
+            if !self.has_feature_snapshot_column("support_level")? {
+                self.connection.borrow().execute_batch(
+                    "ALTER TABLE feature_snapshots ADD COLUMN support_level REAL NOT NULL DEFAULT 0.0",
+                )?;
+            }
+            if !self.has_feature_snapshot_column("resistance_level")? {
+                self.connection.borrow().execute_batch(
+                    "ALTER TABLE feature_snapshots ADD COLUMN resistance_level REAL NOT NULL DEFAULT 0.0",
+                )?;
+            }
+
+            Ok(())
+        }
+
+        fn has_feature_snapshot_column(&self, column_name: &str) -> Result<bool, rusqlite::Error> {
+            let connection = self.connection.borrow();
+            let mut statement = connection.prepare("PRAGMA table_info(feature_snapshots)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+
+            for column in columns {
+                if column? == column_name {
+                    return Ok(true);
+                }
+            }
+
+            Ok(false)
         }
 
         pub fn count_rows(&self, table_name: &str) -> Result<i64, rusqlite::Error> {
@@ -354,6 +381,8 @@ pub mod sqlite {
                     momentum_score,
                     volatility_score,
                     volume_confirmation_score,
+                    support_level,
+                    resistance_level,
                     support_distance,
                     resistance_distance,
                     level_reaction_score
@@ -379,9 +408,11 @@ pub mod sqlite {
                         momentum_score: row.get(4)?,
                         volatility_score: row.get(5)?,
                         volume_confirmation_score: row.get(6)?,
-                        support_distance: row.get(7)?,
-                        resistance_distance: row.get(8)?,
-                        level_reaction_score: row.get(9)?,
+                        support_level: row.get(7)?,
+                        resistance_level: row.get(8)?,
+                        support_distance: row.get(9)?,
+                        resistance_distance: row.get(10)?,
+                        level_reaction_score: row.get(11)?,
                     })
                 },
             )
@@ -737,12 +768,14 @@ pub mod sqlite {
                     momentum_score,
                     volatility_score,
                     volume_confirmation_score,
+                    support_level,
+                    resistance_level,
                     support_distance,
                     resistance_distance,
                     level_reaction_score,
                     feature_version,
                     created_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     identifier,
                     snapshot.instrument_id,
@@ -752,6 +785,8 @@ pub mod sqlite {
                     snapshot.momentum_score,
                     snapshot.volatility_score,
                     snapshot.volume_confirmation_score,
+                    snapshot.support_level,
+                    snapshot.resistance_level,
                     snapshot.support_distance,
                     snapshot.resistance_distance,
                     snapshot.level_reaction_score,
@@ -1232,6 +1267,48 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_existing_feature_snapshot_schema_with_level_columns() {
+        let db_path = temp_db_path("feature-level-migration");
+        let connection = Connection::open(&db_path).expect("sqlite connection should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE feature_snapshots (
+                    id TEXT PRIMARY KEY,
+                    instrument_id TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    trend_score REAL NOT NULL,
+                    momentum_score REAL NOT NULL,
+                    volatility_score REAL NOT NULL,
+                    volume_confirmation_score REAL NOT NULL,
+                    support_distance REAL NOT NULL,
+                    resistance_distance REAL NOT NULL,
+                    level_reaction_score REAL NOT NULL,
+                    feature_version TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                )",
+            )
+            .expect("legacy feature snapshot schema should be created");
+        drop(connection);
+
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migration should upgrade schema");
+
+        let connection = Connection::open(&db_path).expect("sqlite connection should reopen");
+        let columns = connection
+            .prepare("PRAGMA table_info(feature_snapshots)")
+            .expect("feature snapshot columns should be queryable")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("feature snapshot column query should succeed")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("feature snapshot column names should load");
+
+        assert!(columns.iter().any(|column| column == "support_level"));
+        assert!(columns.iter().any(|column| column == "resistance_level"));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn sqlite_store_saves_candle_rows() {
         let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
         store
@@ -1293,6 +1370,8 @@ mod tests {
             momentum_score: 49.88,
             volatility_score: 200.0,
             volume_confirmation_score: 10.0,
+            support_level: 68_400.0,
+            resistance_level: 68_550.0,
             support_distance: 50.0,
             resistance_distance: 100.0,
             level_reaction_score: 150.0,
@@ -1404,6 +1483,8 @@ mod tests {
             momentum_score: 50.0,
             volatility_score: 200.0,
             volume_confirmation_score: 25.0,
+            support_level: 68_400.0,
+            resistance_level: 68_700.0,
             support_distance: 100.0,
             resistance_distance: 150.0,
             level_reaction_score: 250.0,
@@ -1443,6 +1524,8 @@ mod tests {
 
         assert_eq!(overview.live_price_snapshot.last_price.0, 68_550.0);
         assert_eq!(overview.feature_snapshot.trend_score, 500.0);
+        assert_eq!(overview.feature_snapshot.support_level, 68_400.0);
+        assert_eq!(overview.feature_snapshot.resistance_level, 68_700.0);
         assert_eq!(overview.regime_snapshot.regime_label, MarketRegimeLabel::Uptrend);
         assert_eq!(overview.scenario_snapshot.expected_direction, ExpectedDirection::Bullish);
     }
