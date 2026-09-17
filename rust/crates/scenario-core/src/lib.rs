@@ -19,14 +19,56 @@ pub mod aggregation {
     pub struct TimeframeDerivationEngine;
 
     impl TimeframeDerivationEngine {
-        pub fn default_targets(self) -> [Timeframe; 5] {
+        pub fn default_targets(self) -> [Timeframe; 6] {
             [
                 Timeframe::FiveMinutes,
                 Timeframe::FifteenMinutes,
                 Timeframe::OneHour,
                 Timeframe::FourHours,
                 Timeframe::OneDay,
+                Timeframe::OneWeek,
             ]
+        }
+
+        pub fn derive(self, candles: &[Candle], target: Timeframe) -> Vec<Candle> {
+            if target == Timeframe::OneMinute {
+                return Vec::new();
+            }
+
+            let bucket_size_ms = target.minutes() * 60_000;
+            let mut sorted_candles = candles
+                .iter()
+                .filter(|candle| candle.timeframe == Timeframe::OneMinute)
+                .cloned()
+                .collect::<Vec<_>>();
+            sorted_candles.sort_by_key(|candle| candle.open_time.0);
+
+            let mut derived_candles: Vec<Candle> = Vec::new();
+
+            for candle in sorted_candles {
+                let bucket_open_time_ms = (candle.open_time.0 / bucket_size_ms) * bucket_size_ms;
+
+                if let Some(current) = derived_candles.last_mut() {
+                    if current.open_time.0 == bucket_open_time_ms {
+                        current.high.0 = current.high.0.max(candle.high.0);
+                        current.low.0 = current.low.0.min(candle.low.0);
+                        current.close = candle.close;
+                        current.close_time = candle.close_time;
+                        current.volume.0 += candle.volume.0;
+                        current.trade_count += candle.trade_count;
+                        current.is_final &= candle.is_final;
+                        continue;
+                    }
+                }
+
+                let mut derived = candle;
+                derived.timeframe = target;
+                derived.open_time.0 = bucket_open_time_ms;
+                derived.close_time.0 = derived.open_time.0 + bucket_size_ms - 1;
+                derived_candles.push(derived);
+            }
+
+            derived_candles
         }
     }
 
@@ -318,6 +360,7 @@ pub use scenario::{ExpectedDirection, ScenarioScoringStrategy, ScenarioSnapshot,
 
 #[cfg(test)]
 mod tests {
+    use super::aggregation::TimeframeDerivationEngine;
     use super::features::FeatureSnapshotBuilder;
     use super::{MarketRegimeStrategy, ScenarioExplanationBuilder, ScenarioScoringStrategy};
     use market_data_core::candle::Candle;
@@ -325,19 +368,41 @@ mod tests {
     use market_data_core::value_objects::{Price, Timestamp, Volume};
 
     fn build_candle(open: f64, high: f64, low: f64, close: f64, close_time: i64) -> Candle {
+        build_candle_with_stats(
+            close_time - 60_000,
+            open,
+            high,
+            low,
+            close,
+            100.0,
+            10,
+            true,
+        )
+    }
+
+    fn build_candle_with_stats(
+        open_time: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: f64,
+        trade_count: u64,
+        is_final: bool,
+    ) -> Candle {
         Candle {
             instrument_id: "BTC-USD-SPOT".to_owned(),
             source_id: "binance".to_owned(),
             timeframe: Timeframe::OneMinute,
-            open_time: Timestamp::new(close_time - 60_000).unwrap(),
-            close_time: Timestamp::new(close_time).unwrap(),
+            open_time: Timestamp::new(open_time).unwrap(),
+            close_time: Timestamp::new(open_time + 59_999).unwrap(),
             open: Price::new(open).unwrap(),
             high: Price::new(high).unwrap(),
             low: Price::new(low).unwrap(),
             close: Price::new(close).unwrap(),
-            volume: Volume::new(100.0).unwrap(),
-            trade_count: 10,
-            is_final: true,
+            volume: Volume::new(volume).unwrap(),
+            trade_count,
+            is_final,
         }
     }
 
@@ -354,5 +419,48 @@ mod tests {
 
         let probability_sum = scenario.bull_probability + scenario.base_probability + scenario.bear_probability;
         assert!((probability_sum - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn derives_sorted_five_minute_ohlcv_candles() {
+        let candles = vec![
+            build_candle_with_stats(240_000, 104.0, 106.0, 103.0, 105.0, 4.0, 40, true),
+            build_candle_with_stats(60_000, 101.0, 103.0, 100.0, 102.0, 2.0, 20, true),
+            build_candle_with_stats(0, 100.0, 102.0, 99.0, 101.0, 1.0, 10, true),
+            build_candle_with_stats(180_000, 103.0, 105.0, 102.0, 104.0, 3.0, 30, true),
+            build_candle_with_stats(120_000, 102.0, 104.0, 101.0, 103.0, 2.5, 25, false),
+            build_candle_with_stats(300_000, 105.0, 107.0, 104.0, 106.0, 5.0, 50, true),
+        ];
+
+        let derived = TimeframeDerivationEngine.derive(&candles, Timeframe::FiveMinutes);
+
+        assert_eq!(derived.len(), 2);
+        assert_eq!(derived[0].timeframe, Timeframe::FiveMinutes);
+        assert_eq!(derived[0].open_time.0, 0);
+        assert_eq!(derived[0].close_time.0, 299_999);
+        assert_eq!(derived[0].open.0, 100.0);
+        assert_eq!(derived[0].high.0, 106.0);
+        assert_eq!(derived[0].low.0, 99.0);
+        assert_eq!(derived[0].close.0, 105.0);
+        assert_eq!(derived[0].volume.0, 12.5);
+        assert_eq!(derived[0].trade_count, 125);
+        assert!(!derived[0].is_final);
+        assert_eq!(derived[1].open_time.0, 300_000);
+        assert_eq!(derived[1].close.0, 106.0);
+    }
+
+    #[test]
+    fn exposes_all_phase_one_timeframe_targets() {
+        assert_eq!(
+            TimeframeDerivationEngine.default_targets(),
+            [
+                Timeframe::FiveMinutes,
+                Timeframe::FifteenMinutes,
+                Timeframe::OneHour,
+                Timeframe::FourHours,
+                Timeframe::OneDay,
+                Timeframe::OneWeek,
+            ]
+        );
     }
 }
