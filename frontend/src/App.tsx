@@ -66,11 +66,21 @@ type AlertEntry = {
   is_acknowledged: boolean
 }
 
+type SourceHealth = {
+  source_id: string
+  status: string
+  message: string
+  observed_at_ms: number
+  last_successful_update_ms: number | null
+  age_ms: number | null
+}
+
 type DashboardSnapshot = {
   overview: MarketOverview
   candles: Candle[]
   scenarios: ScenarioHistoryEntry[]
   alerts: AlertEntry[]
+  source_health: SourceHealth[]
 }
 
 type ProjectedScenario = {
@@ -257,6 +267,35 @@ function severityTone(severity: string) {
   }
 }
 
+function healthTone(status: string) {
+  switch (status) {
+    case 'healthy':
+      return 'tone-positive'
+    case 'degraded':
+      return 'tone-warning'
+    default:
+      return 'tone-negative'
+  }
+}
+
+function formatAge(ageMs: number | null) {
+  if (ageMs === null) {
+    return 'unknown'
+  }
+
+  const ageSeconds = Math.max(0, Math.floor(ageMs / 1_000))
+  if (ageSeconds < 60) {
+    return `${ageSeconds}s ago`
+  }
+
+  const ageMinutes = Math.floor(ageSeconds / 60)
+  if (ageMinutes < 60) {
+    return `${ageMinutes}m ago`
+  }
+
+  return `${Math.floor(ageMinutes / 60)}h ago`
+}
+
 function hasMatchingScenario(
   scenarios: ScenarioHistoryEntry[],
   triggeredAtMs: number,
@@ -283,11 +322,12 @@ function App() {
       }
 
       try {
-        const [overview, candles, scenarios, alerts] = await Promise.all([
+        const [overview, candles, scenarios, alerts, source_health] = await Promise.all([
           loadJson<MarketOverview>(`/api/market-overview?${timeframeQuery}`),
           loadJson<Candle[]>(`/api/candles?${timeframeQuery}&limit=48`),
           loadJson<ScenarioHistoryEntry[]>(`/api/scenario-history?${timeframeQuery}&limit=6`),
           loadJson<AlertEntry[]>(`/api/alerts?${timeframeQuery}&limit=6`),
+          loadJson<SourceHealth[]>('/api/source-health'),
         ])
 
         if (cancelled) {
@@ -295,7 +335,7 @@ function App() {
         }
 
         startTransition(() => {
-          setSnapshot({ overview, candles, scenarios, alerts })
+          setSnapshot({ overview, candles, scenarios, alerts, source_health })
           setRefreshedAtMs(Date.now())
           setError(null)
           setIsLoading(false)
@@ -357,7 +397,9 @@ function App() {
     )
   }
 
-  const { overview, candles, scenarios, alerts } = snapshot
+  const { overview, candles, scenarios, alerts, source_health } = snapshot
+  const binanceHealth = source_health.find((source) => source.source_id === 'binance')
+  const feedStatus = binanceHealth?.status ?? 'unavailable'
   const bounds = chartBounds(candles)
   const lastCandle = candles[candles.length - 1]
   const selectedScenario = scenarios.find(
@@ -400,6 +442,12 @@ function App() {
               Bias {overview.expected_direction}
             </span>
             <span className="tag tone-neutral">View {overview.timeframe}</span>
+            <span
+              className={`tag ${healthTone(feedStatus)}`}
+              title={binanceHealth?.message ?? 'No Binance health event has been recorded'}
+            >
+              Feed {feedStatus}
+            </span>
           </div>
           <div className="timeframe-control">
             <span className="metric-label">Analysis timeframe</span>
@@ -437,6 +485,10 @@ function App() {
           <div className="metric-row">
             <span className="metric-label">Refresh</span>
             <span>{refreshedAtMs ? clockFormatter.format(new Date(refreshedAtMs)) : 'waiting'}</span>
+          </div>
+          <div className="metric-row">
+            <span className="metric-label">Feed age</span>
+            <span className={healthTone(feedStatus)}>{formatAge(binanceHealth?.age_ms ?? null)}</span>
           </div>
         </div>
       </section>

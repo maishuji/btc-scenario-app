@@ -51,6 +51,21 @@ pub mod models {
         pub scenario_snapshot_id: Option<String>,
         pub is_acknowledged: bool,
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SourceHealthRecord {
+        pub source_id: String,
+        pub status: String,
+        pub message: String,
+        pub observed_at_ms: i64,
+        pub created_at_ms: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SourceHealthSnapshot {
+        pub latest_event: SourceHealthRecord,
+        pub last_successful_update_ms: Option<i64>,
+    }
 }
 
 pub mod repositories {
@@ -95,6 +110,12 @@ pub mod repositories {
         fn save(&self, alert: &AlertRecord) -> Result<(), Self::Error>;
     }
 
+    pub trait SourceHealthRepository {
+        type Error;
+
+        fn save(&self, event: &super::models::SourceHealthRecord) -> Result<(), Self::Error>;
+    }
+
     pub trait MarketOverviewQueryRepository {
         type Error;
 
@@ -137,6 +158,12 @@ pub mod repositories {
             limit: usize,
         ) -> Result<Vec<AlertRecord>, Self::Error>;
     }
+
+    pub trait SourceHealthQueryRepository {
+        type Error;
+
+        fn load_source_health(&self) -> Result<Vec<super::models::SourceHealthSnapshot>, Self::Error>;
+    }
 }
 
 pub mod sqlite {
@@ -145,7 +172,14 @@ pub mod sqlite {
 
     use rusqlite::{params, Connection, OptionalExtension};
 
-    use super::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use super::models::{
+        AlertRecord,
+        CandleRecord,
+        LatestMarketOverviewRecord,
+        ScenarioSnapshotRecord,
+        SourceHealthRecord,
+        SourceHealthSnapshot,
+    };
     use super::repositories::{
         AlertHistoryQueryRepository,
         AlertRepository,
@@ -157,6 +191,8 @@ pub mod sqlite {
         RegimeSnapshotRepository,
         ScenarioHistoryQueryRepository,
         ScenarioSnapshotRepository,
+        SourceHealthQueryRepository,
+        SourceHealthRepository,
     };
     use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
     use market_data_core::timeframe::Timeframe;
@@ -333,6 +369,57 @@ pub mod sqlite {
             let mut alerts = rows.collect::<Result<Vec<_>, _>>()?;
             alerts.reverse();
             Ok(alerts)
+        }
+
+        pub fn load_source_health_snapshots(&self) -> Result<Vec<SourceHealthSnapshot>, rusqlite::Error> {
+            let connection = self.connection.borrow();
+            let mut statement = connection.prepare(
+                "SELECT
+                    latest.source_id,
+                    latest.status,
+                    latest.message,
+                    latest.observed_at_ms,
+                    latest.created_at_ms,
+                    (
+                        SELECT MAX(success.observed_at_ms)
+                        FROM source_health_events AS success
+                        WHERE success.source_id = latest.source_id
+                          AND success.status = 'healthy'
+                    )
+                 FROM source_health_events AS latest
+                 WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM source_health_events AS newer
+                    WHERE newer.source_id = latest.source_id
+                      AND (
+                        newer.observed_at_ms > latest.observed_at_ms
+                        OR (
+                            newer.observed_at_ms = latest.observed_at_ms
+                            AND newer.created_at_ms > latest.created_at_ms
+                        )
+                        OR (
+                            newer.observed_at_ms = latest.observed_at_ms
+                            AND newer.created_at_ms = latest.created_at_ms
+                            AND newer.id > latest.id
+                        )
+                      )
+                 )
+                 ORDER BY latest.source_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(SourceHealthSnapshot {
+                    latest_event: SourceHealthRecord {
+                        source_id: row.get(0)?,
+                        status: row.get(1)?,
+                        message: row.get(2)?,
+                        observed_at_ms: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                    },
+                    last_successful_update_ms: row.get(5)?,
+                })
+            })?;
+
+            rows.collect()
         }
 
         fn load_latest_live_price_snapshot(
@@ -927,6 +1014,37 @@ pub mod sqlite {
         }
     }
 
+    impl SourceHealthRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn save(&self, event: &SourceHealthRecord) -> Result<(), Self::Error> {
+            let identifier = format!(
+                "{}:{}:{}",
+                event.source_id, event.status, event.observed_at_ms
+            );
+            self.connection.borrow().execute(
+                "INSERT OR REPLACE INTO source_health_events (
+                    id,
+                    source_id,
+                    status,
+                    message,
+                    observed_at_ms,
+                    created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    identifier,
+                    event.source_id,
+                    event.status,
+                    event.message,
+                    event.observed_at_ms,
+                    event.created_at_ms,
+                ],
+            )?;
+
+            Ok(())
+        }
+    }
+
     impl MarketOverviewQueryRepository for SqliteMarketDataStore {
         type Error = rusqlite::Error;
 
@@ -1005,17 +1123,32 @@ pub mod sqlite {
             self.load_recent_alerts(instrument_id, timeframe, limit)
         }
     }
+
+    impl SourceHealthQueryRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn load_source_health(&self) -> Result<Vec<SourceHealthSnapshot>, Self::Error> {
+            self.load_source_health_snapshots()
+        }
+    }
 }
 
 pub mod queries {
     use market_data_core::timeframe::Timeframe;
 
-    use super::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use super::models::{
+        AlertRecord,
+        CandleRecord,
+        LatestMarketOverviewRecord,
+        ScenarioSnapshotRecord,
+        SourceHealthSnapshot,
+    };
     use super::repositories::{
         AlertHistoryQueryRepository,
         CandleHistoryQueryRepository,
         MarketOverviewQueryRepository,
         ScenarioHistoryQueryRepository,
+        SourceHealthQueryRepository,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1139,6 +1272,25 @@ pub mod queries {
             repository.load_alert_history(&query.instrument_id, query.timeframe, query.limit)
         }
     }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct SourceHealthQuery;
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct SourceHealthQueryService;
+
+    impl SourceHealthQueryService {
+        pub fn load<R>(
+            self,
+            repository: &R,
+            _query: &SourceHealthQuery,
+        ) -> Result<Vec<SourceHealthSnapshot>, R::Error>
+        where
+            R: SourceHealthQueryRepository,
+        {
+            repository.load_source_health()
+        }
+    }
 }
 
 pub mod writes {
@@ -1199,6 +1351,8 @@ mod tests {
         RegimeSnapshotRepository,
         ScenarioHistoryQueryRepository,
         ScenarioSnapshotRepository,
+        SourceHealthQueryRepository,
+        SourceHealthRepository,
     };
     use super::sqlite::SqliteMarketDataStore;
     use super::Candle;
@@ -1424,6 +1578,42 @@ mod tests {
         AlertRepository::save(&store, &alert).expect("alert should save");
 
         assert_eq!(store.count_rows("alerts").unwrap(), 1);
+    }
+
+    #[test]
+    fn sqlite_store_loads_latest_source_health_and_last_success() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        SourceHealthRepository::save(
+            &store,
+            &super::models::SourceHealthRecord {
+                source_id: "binance".to_owned(),
+                status: "healthy".to_owned(),
+                message: "Binance sync succeeded".to_owned(),
+                observed_at_ms: 1_710_000_000_000,
+                created_at_ms: 1_710_000_000_000,
+            },
+        )
+        .expect("healthy source event should save");
+        SourceHealthRepository::save(
+            &store,
+            &super::models::SourceHealthRecord {
+                source_id: "binance".to_owned(),
+                status: "unavailable".to_owned(),
+                message: "Binance sync failed".to_owned(),
+                observed_at_ms: 1_710_000_060_000,
+                created_at_ms: 1_710_000_060_000,
+            },
+        )
+        .expect("unavailable source event should save");
+
+        let health = SourceHealthQueryRepository::load_source_health(&store)
+            .expect("source health should load");
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].latest_event.status, "unavailable");
+        assert_eq!(health[0].last_successful_update_ms, Some(1_710_000_000_000));
     }
 
     #[test]

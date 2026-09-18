@@ -7,6 +7,7 @@ mod config {
         pub api_bind_address: String,
         pub live_sync_message_limit: usize,
         pub api_sync_interval_secs: u64,
+        pub source_health_stale_after_secs: u64,
     }
 
     impl Default for AppConfig {
@@ -18,7 +19,16 @@ mod config {
                 api_bind_address: "127.0.0.1:3000".to_owned(),
                 live_sync_message_limit: 2,
                 api_sync_interval_secs: 30,
+                source_health_stale_after_secs: 90,
             }
+        }
+    }
+
+    impl AppConfig {
+        pub fn source_health_stale_after_ms(&self) -> i64 {
+            self.source_health_stale_after_secs
+                .min(i64::MAX as u64 / 1_000)
+                .saturating_mul(1_000) as i64
         }
     }
 }
@@ -29,6 +39,7 @@ mod api {
     use axum::routing::get;
     use axum::{Json, Router};
     use market_data_core::timeframe::Timeframe;
+    use market_data_infrastructure::health::{SourceHealthMonitor, SourceStatus};
     use persistence_core::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
     use persistence_core::queries::{
         AlertHistoryQuery,
@@ -39,9 +50,12 @@ mod api {
         MarketOverviewQueryService,
         ScenarioHistoryQuery,
         ScenarioHistoryQueryService,
+        SourceHealthQuery,
+        SourceHealthQueryService,
     };
     use persistence_core::sqlite::SqliteMarketDataStore;
     use serde::{Deserialize, Serialize};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::AppConfig;
 
@@ -49,6 +63,7 @@ mod api {
     pub struct ApiState {
         pub market_data_db_path: String,
         pub instrument_id: String,
+        pub source_health_stale_after_ms: i64,
     }
 
     impl ApiState {
@@ -56,6 +71,7 @@ mod api {
             Self {
                 market_data_db_path: config.market_data_db_path.clone(),
                 instrument_id: config.instrument_symbol.clone(),
+                source_health_stale_after_ms: config.source_health_stale_after_ms(),
             }
         }
     }
@@ -216,12 +232,23 @@ mod api {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct SourceHealthResponse {
+        pub source_id: String,
+        pub status: String,
+        pub message: String,
+        pub observed_at_ms: i64,
+        pub last_successful_update_ms: Option<i64>,
+        pub age_ms: Option<i64>,
+    }
+
     pub fn build_router(state: ApiState) -> Router {
         Router::new()
             .route("/api/market-overview", get(get_market_overview))
             .route("/api/candles", get(get_candles))
             .route("/api/scenario-history", get(get_scenario_history))
             .route("/api/alerts", get(get_alerts))
+            .route("/api/source-health", get(get_source_health))
             .with_state(state)
     }
 
@@ -314,6 +341,46 @@ mod api {
         ))
     }
 
+    pub async fn get_source_health(
+        State(state): State<ApiState>,
+    ) -> Result<Json<Vec<SourceHealthResponse>>, StatusCode> {
+        let store = open_store(&state)?;
+        let query = SourceHealthQuery;
+        let health = SourceHealthQueryService
+            .load(&store, &query)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let now_ms = current_time_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let monitor = SourceHealthMonitor;
+
+        Ok(Json(
+            health
+                .into_iter()
+                .map(|snapshot| {
+                    let last_successful_update_ms = snapshot.last_successful_update_ms;
+                    let status = if snapshot.latest_event.status == SourceStatus::Healthy.as_str() {
+                        monitor.classify(
+                            now_ms,
+                            last_successful_update_ms.unwrap_or(snapshot.latest_event.observed_at_ms),
+                            state.source_health_stale_after_ms,
+                        )
+                    } else {
+                        source_status_from_str(snapshot.latest_event.status.as_str())
+                    };
+
+                    SourceHealthResponse {
+                        source_id: snapshot.latest_event.source_id,
+                        status: status.as_str().to_owned(),
+                        message: snapshot.latest_event.message,
+                        observed_at_ms: snapshot.latest_event.observed_at_ms,
+                        last_successful_update_ms,
+                        age_ms: last_successful_update_ms
+                            .map(|observed_at_ms| now_ms.saturating_sub(observed_at_ms)),
+                    }
+                })
+                .collect(),
+        ))
+    }
+
     fn open_store(state: &ApiState) -> Result<SqliteMarketDataStore, StatusCode> {
         let store = SqliteMarketDataStore::open(&state.market_data_db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -333,6 +400,21 @@ mod api {
 
     fn normalize_limit(value: Option<usize>, default_limit: usize) -> usize {
         value.unwrap_or(default_limit).clamp(1, 1_000)
+    }
+
+    fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+    }
+
+    fn source_status_from_str(value: &str) -> SourceStatus {
+        match value {
+            "healthy" => SourceStatus::Healthy,
+            "degraded" => SourceStatus::Degraded,
+            "unavailable" => SourceStatus::Unavailable,
+            _ => SourceStatus::Unavailable,
+        }
     }
 
     fn regime_label_as_str(value: scenario_core::MarketRegimeLabel) -> &'static str {
@@ -371,8 +453,11 @@ mod tasks {
         LivePriceSnapshotRepository,
         RegimeSnapshotRepository,
         ScenarioSnapshotRepository,
+        SourceHealthRepository,
     };
+    use persistence_core::models::SourceHealthRecord;
     use persistence_core::sqlite::SqliteMarketDataStore;
+    use market_data_infrastructure::health::SourceStatus;
     use scenario_core::{
         aggregation::TimeframeDerivationEngine,
         ExpectedDirection,
@@ -382,6 +467,7 @@ mod tasks {
         ScenarioExplanationBuilder,
         ScenarioSnapshotFactory,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct BinanceBootstrapIngestionTask;
@@ -409,6 +495,30 @@ mod tasks {
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct SnapshotAlertFactory;
+
+    pub fn persist_binance_health_event(
+        store: &SqliteMarketDataStore,
+        status: SourceStatus,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        let observed_at_ms = current_time_ms()?;
+        let event = SourceHealthRecord {
+            source_id: "binance".to_owned(),
+            status: status.as_str().to_owned(),
+            message: message.into(),
+            observed_at_ms,
+            created_at_ms: observed_at_ms,
+        };
+
+        SourceHealthRepository::save(store, &event).map_err(|error| error.to_string())
+    }
+
+    fn current_time_ms() -> Result<i64, String> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+    }
 
     impl SnapshotAlertFactory {
         pub fn build(
@@ -603,6 +713,11 @@ mod tasks {
             let persisted_analytics_count = AnalyticsSnapshotPipeline
                 .compute_and_persist(store, &candles)?
                 + AnalyticsSnapshotPipeline.persist_timeframe_views(store, &candles)?;
+            persist_binance_health_event(
+                store,
+                SourceStatus::Healthy,
+                "Binance REST sync and BTC analytics completed successfully",
+            )?;
             let latest_market_overview = MarketOverviewReadTask
                 .load_latest(store, &instrument, Timeframe::OneMinute)?;
 
@@ -639,7 +754,7 @@ mod tasks {
     impl BinanceLiveSyncTask {
         pub fn persist_stream_payloads(
             self,
-            config: &AppConfig,
+            _config: &AppConfig,
             store: &SqliteMarketDataStore,
             payloads: &[&str],
         ) -> Result<LiveSyncSummary, String> {
@@ -664,7 +779,6 @@ mod tasks {
                 }
             }
 
-            let _ = config;
             let persisted_analytics_count = if latest_candles.is_empty() {
                 0
             } else {
@@ -675,6 +789,21 @@ mod tasks {
                     .compute_and_persist(store, &candles)?
                     + AnalyticsSnapshotPipeline.persist_timeframe_views(store, &candles)?
             };
+            let (health_status, health_message) = if payloads.is_empty() {
+                (
+                    SourceStatus::Degraded,
+                    "Binance live stream returned no messages during the sync window".to_owned(),
+                )
+            } else {
+                (
+                    SourceStatus::Healthy,
+                    format!(
+                        "Binance live stream sync processed {} messages",
+                        payloads.len()
+                    ),
+                )
+            };
+            persist_binance_health_event(store, health_status, health_message)?;
             let latest_market_overview = MarketOverviewReadTask
                 .load_latest(store, &instrument, Timeframe::OneMinute)?;
 
@@ -720,7 +849,15 @@ mod runtime {
     use std::time::Duration;
 
     use crate::config::AppConfig;
-    use crate::tasks::{open_market_data_store, BinanceBootstrapIngestionTask, BinanceLiveSyncTask, IngestionSummary, LiveSyncSummary};
+    use crate::tasks::{
+        open_market_data_store,
+        persist_binance_health_event,
+        BinanceBootstrapIngestionTask,
+        BinanceLiveSyncTask,
+        IngestionSummary,
+        LiveSyncSummary,
+    };
+    use market_data_infrastructure::health::{SourceHealthMonitor, SourceStatus};
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct RuntimeSummary {
@@ -750,9 +887,54 @@ mod runtime {
     pub async fn run_sync_cycle(config: &AppConfig) -> Result<RuntimeSummary, String> {
         let config = config.clone();
 
-        tokio::task::spawn_blocking(move || Runtime { config }.run())
+        tokio::task::spawn_blocking(move || {
+            let result = Runtime { config: config.clone() }.run();
+            if let Err(error) = &result {
+                record_binance_sync_failure(&config, error);
+            }
+            result
+        })
             .await
             .map_err(|error| format!("market data sync task failed: {error}"))?
+    }
+
+    fn record_binance_sync_failure(config: &AppConfig, error: &str) {
+        let Ok(store) = open_market_data_store(config) else {
+            return;
+        };
+
+        let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
+            Err(_) => return,
+        };
+        let last_successful_update_ms = store
+            .load_source_health_snapshots()
+            .ok()
+            .and_then(|snapshots| {
+                snapshots
+                    .into_iter()
+                    .find(|snapshot| snapshot.latest_event.source_id == "binance")
+                    .and_then(|snapshot| snapshot.last_successful_update_ms)
+            });
+        let classified_status = last_successful_update_ms
+            .map(|observed_at_ms| {
+                SourceHealthMonitor.classify(
+                    now_ms,
+                    observed_at_ms,
+                    config.source_health_stale_after_ms(),
+                )
+            })
+            .unwrap_or(SourceStatus::Unavailable);
+        let status = match classified_status {
+            SourceStatus::Healthy | SourceStatus::Degraded => SourceStatus::Degraded,
+            SourceStatus::Unavailable => SourceStatus::Unavailable,
+        };
+
+        let _ = persist_binance_health_event(
+            &store,
+            status,
+            format!("Binance sync failed: {error}"),
+        );
     }
 
     pub fn spawn_periodic_sync(config: AppConfig) {
@@ -835,13 +1017,23 @@ async fn main() {
 mod tests {
     use axum::extract::State;
     use super::config::AppConfig;
-    use super::api::{get_alerts, get_candles, get_market_overview, get_scenario_history, ApiListQuery, ApiState};
+    use super::api::{
+        get_alerts,
+        get_candles,
+        get_market_overview,
+        get_scenario_history,
+        get_source_health,
+        ApiListQuery,
+        ApiState,
+    };
     use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask};
     use axum::extract::Query;
     use persistence_core::repositories::AlertHistoryQueryRepository;
     use persistence_core::repositories::RegimeSnapshotRepository;
+    use persistence_core::repositories::SourceHealthRepository;
     use persistence_core::sqlite::SqliteMarketDataStore;
     use persistence_core::repositories::ScenarioSnapshotRepository;
+    use persistence_core::models::SourceHealthRecord;
     use rusqlite::{params, Connection};
     use scenario_core::{ExpectedDirection, MarketRegimeLabel};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -899,6 +1091,7 @@ mod tests {
         assert_eq!(store.count_rows("feature_snapshots").unwrap(), 7);
         assert_eq!(store.count_rows("regime_snapshots").unwrap(), 7);
         assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 7);
+        assert_eq!(store.count_rows("source_health_events").unwrap(), 1);
     }
 
     #[test]
@@ -967,6 +1160,7 @@ mod tests {
         assert_eq!(store.count_rows("feature_snapshots").unwrap(), 7);
         assert_eq!(store.count_rows("regime_snapshots").unwrap(), 7);
         assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 7);
+        assert_eq!(store.count_rows("source_health_events").unwrap(), 1);
     }
 
     #[test]
@@ -1104,6 +1298,45 @@ mod tests {
         .expect("api handler should return higher timeframe market overview");
 
         assert_eq!(higher_timeframe_response.0.timeframe, "5m");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn returns_degraded_source_health_when_last_success_is_stale() {
+        let db_path = temp_db_path("source-health-handler");
+        let config = AppConfig {
+            market_data_db_path: db_path.clone(),
+            source_health_stale_after_secs: 1,
+            ..AppConfig::default()
+        };
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_millis() as i64;
+
+        SourceHealthRepository::save(
+            &store,
+            &SourceHealthRecord {
+                source_id: "binance".to_owned(),
+                status: "healthy".to_owned(),
+                message: "Binance sync succeeded".to_owned(),
+                observed_at_ms: now_ms.saturating_sub(2_000),
+                created_at_ms: now_ms.saturating_sub(2_000),
+            },
+        )
+        .expect("source health event should save");
+
+        let response = get_source_health(State(ApiState::from_config(&config)))
+            .await
+            .expect("source health handler should succeed");
+
+        assert_eq!(response.0.len(), 1);
+        assert_eq!(response.0[0].source_id, "binance");
+        assert_eq!(response.0[0].status, "degraded");
+        assert!(response.0[0].age_ms.is_some());
 
         let _ = std::fs::remove_file(db_path);
     }
