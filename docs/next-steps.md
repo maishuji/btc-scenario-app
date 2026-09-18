@@ -14,12 +14,15 @@ The Rust workspace now covers the main backend MVP path for a BTC-first scenario
 - The application can read the latest market overview from persistence.
 - A frontend dashboard shell renders market overview, chart context, scenario history, and alerts.
 - Alerts and scenario history can drive chart projections in the frontend.
+- Binance source health events are persisted and exposed with dynamic freshness status.
+- The frontend shows source status and feed age alongside the market overview.
 - Local development can start the API and frontend together with `npm run dev` from the repo root.
 - The API currently exposes:
   - `GET /api/market-overview`
   - `GET /api/candles?timeframe=1m&limit=...`
   - `GET /api/scenario-history?timeframe=1m&limit=...`
   - `GET /api/alerts?limit=...`
+  - `GET /api/source-health`
 
 Recent completed commits:
 
@@ -37,44 +40,41 @@ Recent completed commits:
 
 The next work should stay focused on making the system usable by a frontend without widening into new data sources too early.
 
-### 1. Add Higher Timeframes
+### 1. Add Secondary Source Validation
 
 Goal:
 
-- Expand from canonical 1m data into derived user-facing timeframes.
+- Compare Binance against Kraken and make source divergence visible.
 
 Why next:
 
-- The frontend now makes the single-timeframe limitation visible.
-- Higher timeframe context is more valuable than more UI polish on only `1m` data.
-- The backend already has a stable canonical candle path to derive from.
+- Binance health is now persisted and exposed, but Kraken and CoinGecko remain scaffolding.
+- A second exchange can validate the primary feed without changing the canonical BTC workflow.
 
 Recommended scope:
 
-- Derive `5m`, `15m`, and `1h` candles from canonical `1m` data.
-- Expose those timeframes through the existing candle and scenario endpoints.
-- Let the frontend switch between supported timeframes.
+- Pull a lightweight Kraken reference price during the periodic sync.
+- Record divergence and validation status in source health events.
+- Keep Binance as the primary source until validation shows it is stale or divergent.
 
 Suggested first version:
 
-- Start with `5m` and `15m` if `1h` widens the slice too much.
-- Keep derivation inside the backend instead of rebuilding candles client-side.
+- Keep the validation path read-only and scoped to BTC spot.
 
-### 2. Split Runtime Roles If Needed
+### 2. Harden Partial Failures
 
 Goal:
 
-- Separate ingestion and API serving if running both in one binary becomes awkward.
+- Keep the last good dashboard snapshot when individual refreshes fail.
 
-Why later:
+Why next:
 
-- The current `serve-api` mode is enough for local iteration.
-- Process separation is useful, but it is not the highest product-value step right now.
+- Source health now makes degraded data visible, so the UI should preserve useful context during outages.
 
 Possible directions:
 
-- Separate binaries in the same crate.
-- Separate app crates for ingestion and API.
+- Load dashboard endpoints independently.
+- Preserve the last successful snapshot while showing a degraded banner.
 
 ### 3. Enrich Alert Metadata
 
@@ -82,7 +82,7 @@ Goal:
 
 - Make alert interactions more explicit and less dependent on timestamp matching.
 
-Why after higher timeframes:
+Why later:
 
 - The current alert tape is already useful for local iteration.
 - Timeframe expansion will reveal whether alert contracts need extra fields.
@@ -94,13 +94,13 @@ Recommended scope:
 
 ## Suggested Tomorrow Starting Point
 
-If the goal is steady MVP progress, start with higher timeframes.
+If the goal is steady MVP progress, start with secondary source validation.
 
 Concrete next task:
 
-1. Add backend candle derivation for `5m` and `15m`.
-2. Expose those timeframes through the current API surface.
-3. Add a frontend timeframe selector.
+1. Add a read-only Kraken BTC/USD reference-price adapter.
+2. Compare it with the latest Binance snapshot during periodic sync.
+3. Persist divergence as a source-health event.
 4. Validate with crate-scoped tests, `npm run build`, and `cargo test --workspace`.
 
 ## Relevant Files To Open First Tomorrow

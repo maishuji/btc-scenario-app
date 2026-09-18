@@ -486,6 +486,16 @@ pub mod health {
         Unavailable,
     }
 
+    impl SourceStatus {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Healthy => "healthy",
+                Self::Degraded => "degraded",
+                Self::Unavailable => "unavailable",
+            }
+        }
+    }
+
     #[derive(Debug, Default, Clone, Copy)]
     pub struct SourceHealthMonitor;
 
