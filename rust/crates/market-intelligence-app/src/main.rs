@@ -8,6 +8,7 @@ mod config {
         pub live_sync_message_limit: usize,
         pub api_sync_interval_secs: u64,
         pub source_health_stale_after_secs: u64,
+        pub kraken_max_divergence_basis_points: u64,
     }
 
     impl Default for AppConfig {
@@ -20,6 +21,7 @@ mod config {
                 live_sync_message_limit: 2,
                 api_sync_interval_secs: 30,
                 source_health_stale_after_secs: 90,
+                kraken_max_divergence_basis_points: 100,
             }
         }
     }
@@ -441,8 +443,10 @@ mod tasks {
 
     use crate::config::AppConfig;
     use market_data_core::instrument::Instrument;
+    use market_data_core::snapshot::LivePriceSnapshot;
     use market_data_infrastructure::adapters::BinanceMarketDataAdapter;
     use market_data_infrastructure::adapters::BinanceStreamEvent;
+    use market_data_infrastructure::adapters::KrakenMarketDataAdapter;
     use market_data_core::timeframe::Timeframe;
     use persistence_core::models::{AlertRecord, LatestMarketOverviewRecord};
     use persistence_core::queries::{LatestMarketOverviewQuery, MarketOverviewQueryService};
@@ -496,14 +500,26 @@ mod tasks {
     #[derive(Debug, Default, Clone, Copy)]
     pub struct SnapshotAlertFactory;
 
-    pub fn persist_binance_health_event(
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct KrakenValidationSummary {
+        pub status: SourceStatus,
+        pub binance_price: f64,
+        pub reference_price: Option<f64>,
+        pub divergence_percent: Option<f64>,
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct KrakenValidationTask;
+
+    pub fn persist_source_health_event(
         store: &SqliteMarketDataStore,
+        source_id: &str,
         status: SourceStatus,
         message: impl Into<String>,
     ) -> Result<(), String> {
         let observed_at_ms = current_time_ms()?;
         let event = SourceHealthRecord {
-            source_id: "binance".to_owned(),
+            source_id: source_id.to_owned(),
             status: status.as_str().to_owned(),
             message: message.into(),
             observed_at_ms,
@@ -513,11 +529,120 @@ mod tasks {
         SourceHealthRepository::save(store, &event).map_err(|error| error.to_string())
     }
 
+    pub fn persist_binance_health_event(
+        store: &SqliteMarketDataStore,
+        status: SourceStatus,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        persist_source_health_event(store, "binance", status, message)
+    }
+
     fn current_time_ms() -> Result<i64, String> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())
             .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+    }
+
+    impl KrakenValidationTask {
+        const REFERENCE_PAIR: &'static str = "XBTUSD";
+
+        pub fn validate_latest_binance_snapshot(
+            self,
+            config: &AppConfig,
+            store: &SqliteMarketDataStore,
+            binance_snapshot: &LivePriceSnapshot,
+        ) -> Result<KrakenValidationSummary, String> {
+            let adapter = KrakenMarketDataAdapter;
+            let request = adapter.build_reference_price_request(Self::REFERENCE_PAIR);
+            let payload = match adapter.rest_client().execute_text(&request) {
+                Ok(response) => response.body,
+                Err(error) => {
+                    persist_source_health_event(
+                        store,
+                        "kraken",
+                        SourceStatus::Unavailable,
+                        format!("Kraken reference validation request failed: {error}"),
+                    )?;
+                    return Ok(KrakenValidationSummary {
+                        status: SourceStatus::Unavailable,
+                        binance_price: binance_snapshot.last_price.0,
+                        reference_price: None,
+                        divergence_percent: None,
+                    });
+                }
+            };
+
+            self.validate_reference_payload(config, store, binance_snapshot, &payload)
+        }
+
+        pub fn validate_reference_payload(
+            self,
+            config: &AppConfig,
+            store: &SqliteMarketDataStore,
+            binance_snapshot: &LivePriceSnapshot,
+            payload: &str,
+        ) -> Result<KrakenValidationSummary, String> {
+            let adapter = KrakenMarketDataAdapter;
+            let binance_price = binance_snapshot.last_price.0;
+            let reference_price = match adapter.parse_reference_price_response(payload) {
+                Ok(price) => price.0,
+                Err(error) => {
+                    persist_source_health_event(
+                        store,
+                        "kraken",
+                        SourceStatus::Unavailable,
+                        format!("Kraken reference validation response was invalid: {error}"),
+                    )?;
+                    return Ok(KrakenValidationSummary {
+                        status: SourceStatus::Unavailable,
+                        binance_price,
+                        reference_price: None,
+                        divergence_percent: None,
+                    });
+                }
+            };
+
+            if binance_price <= 0.0 {
+                persist_source_health_event(
+                    store,
+                    "kraken",
+                    SourceStatus::Unavailable,
+                    "Kraken reference validation skipped because the Binance price is not positive",
+                )?;
+                return Ok(KrakenValidationSummary {
+                    status: SourceStatus::Unavailable,
+                    binance_price,
+                    reference_price: Some(reference_price),
+                    divergence_percent: None,
+                });
+            }
+
+            let divergence_percent = ((reference_price - binance_price).abs() / binance_price) * 100.0;
+            let max_divergence_percent = config.kraken_max_divergence_basis_points as f64 / 100.0;
+            let status = if divergence_percent <= max_divergence_percent {
+                SourceStatus::Healthy
+            } else {
+                SourceStatus::Degraded
+            };
+            let message = format!(
+                "Kraken reference validation {}: Binance {:.2}, Kraken {:.2}, divergence {:.3}% (threshold {:.2}%)",
+                status.as_str(),
+                binance_price,
+                reference_price,
+                divergence_percent,
+                max_divergence_percent,
+            );
+
+            persist_source_health_event(store, "kraken", status, message)?;
+
+            Ok(KrakenValidationSummary {
+                status,
+                binance_price,
+                reference_price: Some(reference_price),
+                divergence_percent: Some(divergence_percent),
+            })
+        }
     }
 
     impl SnapshotAlertFactory {
@@ -855,6 +980,7 @@ mod runtime {
         BinanceBootstrapIngestionTask,
         BinanceLiveSyncTask,
         IngestionSummary,
+        KrakenValidationTask,
         LiveSyncSummary,
     };
     use market_data_infrastructure::health::{SourceHealthMonitor, SourceStatus};
@@ -876,6 +1002,21 @@ mod runtime {
             let bootstrap = BinanceBootstrapIngestionTask
                 .ingest_bootstrap_cycle_into_store(&self.config, &store)?;
             let live_sync = BinanceLiveSyncTask.consume_live_stream_messages(&self.config, &store)?;
+
+            if let Some(overview) = live_sync.latest_market_overview.as_ref() {
+                KrakenValidationTask.validate_latest_binance_snapshot(
+                    &self.config,
+                    &store,
+                    &overview.live_price_snapshot,
+                )?;
+            } else {
+                crate::tasks::persist_source_health_event(
+                    &store,
+                    "kraken",
+                    SourceStatus::Unavailable,
+                    "Kraken reference validation skipped because no Binance snapshot is available",
+                )?;
+            }
 
             Ok(RuntimeSummary {
                 bootstrap,
@@ -1026,14 +1167,18 @@ mod tests {
         ApiListQuery,
         ApiState,
     };
-    use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask};
+    use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask, KrakenValidationTask};
     use axum::extract::Query;
+    use market_data_infrastructure::health::SourceStatus;
     use persistence_core::repositories::AlertHistoryQueryRepository;
     use persistence_core::repositories::RegimeSnapshotRepository;
+    use persistence_core::repositories::SourceHealthQueryRepository;
     use persistence_core::repositories::SourceHealthRepository;
     use persistence_core::sqlite::SqliteMarketDataStore;
     use persistence_core::repositories::ScenarioSnapshotRepository;
     use persistence_core::models::SourceHealthRecord;
+    use market_data_core::snapshot::LivePriceSnapshot;
+    use market_data_core::value_objects::{Price, Timestamp, Volume};
     use rusqlite::{params, Connection};
     use scenario_core::{ExpectedDirection, MarketRegimeLabel};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1161,6 +1306,92 @@ mod tests {
         assert_eq!(store.count_rows("regime_snapshots").unwrap(), 7);
         assert_eq!(store.count_rows("scenario_snapshots").unwrap(), 7);
         assert_eq!(store.count_rows("source_health_events").unwrap(), 1);
+    }
+
+    fn build_binance_snapshot(last_price: f64) -> LivePriceSnapshot {
+        LivePriceSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            source_id: "binance".to_owned(),
+            last_price: Price::new(last_price).unwrap(),
+            price_change_24h: 0.0,
+            volume_24h: Volume::new(1_000.0).unwrap(),
+            observed_at: Timestamp::new(1_710_000_120_000).unwrap(),
+        }
+    }
+
+    #[test]
+    fn persists_healthy_kraken_validation_event_for_small_divergence() {
+        let config = AppConfig::default();
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let summary = KrakenValidationTask
+            .validate_reference_payload(
+                &config,
+                &store,
+                &build_binance_snapshot(68_500.0),
+                r#"{"error":[],"result":{"XXBTZUSD":{"c":["68520.00","0.001"]}}}"#,
+            )
+            .expect("Kraken validation should succeed");
+
+        assert_eq!(summary.status, SourceStatus::Healthy);
+        assert_eq!(summary.reference_price, Some(68_520.0));
+        assert!(summary.divergence_percent.unwrap() < 1.0);
+
+        let health = SourceHealthQueryRepository::load_source_health(&store)
+            .expect("Kraken health should load");
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].latest_event.source_id, "kraken");
+        assert_eq!(health[0].latest_event.status, "healthy");
+        assert!(health[0].latest_event.message.contains("divergence"));
+    }
+
+    #[test]
+    fn persists_degraded_kraken_validation_event_for_large_divergence() {
+        let config = AppConfig::default();
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let summary = KrakenValidationTask
+            .validate_reference_payload(
+                &config,
+                &store,
+                &build_binance_snapshot(68_500.0),
+                r#"{"error":[],"result":{"XXBTZUSD":{"c":["70000.00","0.001"]}}}"#,
+            )
+            .expect("Kraken validation should succeed");
+
+        assert_eq!(summary.status, SourceStatus::Degraded);
+        assert!(summary.divergence_percent.unwrap() > 1.0);
+
+        let health = SourceHealthQueryRepository::load_source_health(&store)
+            .expect("Kraken health should load");
+        assert_eq!(health[0].latest_event.status, "degraded");
+    }
+
+    #[test]
+    fn persists_unavailable_kraken_validation_event_for_invalid_response() {
+        let config = AppConfig::default();
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let summary = KrakenValidationTask
+            .validate_reference_payload(
+                &config,
+                &store,
+                &build_binance_snapshot(68_500.0),
+                r#"{"error":["EQuery:Unknown asset pair"],"result":{}}"#,
+            )
+            .expect("invalid Kraken response should be recorded");
+
+        assert_eq!(summary.status, SourceStatus::Unavailable);
+        assert_eq!(summary.reference_price, None);
+        assert_eq!(summary.divergence_percent, None);
+
+        let health = SourceHealthQueryRepository::load_source_health(&store)
+            .expect("Kraken health should load");
+        assert_eq!(health[0].latest_event.status, "unavailable");
+        assert!(health[0].latest_event.message.contains("invalid"));
     }
 
     #[test]
