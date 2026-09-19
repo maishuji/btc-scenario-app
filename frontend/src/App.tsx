@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState } from 'react'
+import { startTransition, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 type MarketOverview = {
@@ -305,6 +305,7 @@ function hasMatchingScenario(
 
 function App() {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null)
+  const snapshotRef = useRef<DashboardSnapshot | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshedAtMs, setRefreshedAtMs] = useState<number | null>(null)
@@ -321,37 +322,79 @@ function App() {
         setIsLoading(true)
       }
 
-      try {
-        const [overview, candles, scenarios, alerts, source_health] = await Promise.all([
-          loadJson<MarketOverview>(`/api/market-overview?${timeframeQuery}`),
-          loadJson<Candle[]>(`/api/candles?${timeframeQuery}&limit=48`),
-          loadJson<ScenarioHistoryEntry[]>(`/api/scenario-history?${timeframeQuery}&limit=6`),
-          loadJson<AlertEntry[]>(`/api/alerts?${timeframeQuery}&limit=6`),
-          loadJson<SourceHealth[]>('/api/source-health'),
-        ])
+      const [overviewResult, candlesResult, scenariosResult, alertsResult, sourceHealthResult] = await Promise.allSettled([
+        loadJson<MarketOverview>(`/api/market-overview?${timeframeQuery}`),
+        loadJson<Candle[]>(`/api/candles?${timeframeQuery}&limit=48`),
+        loadJson<ScenarioHistoryEntry[]>(`/api/scenario-history?${timeframeQuery}&limit=6`),
+        loadJson<AlertEntry[]>(`/api/alerts?${timeframeQuery}&limit=6`),
+        loadJson<SourceHealth[]>('/api/source-health'),
+      ])
 
-        if (cancelled) {
-          return
-        }
+      if (cancelled) {
+        return
+      }
 
-        startTransition(() => {
-          setSnapshot({ overview, candles, scenarios, alerts, source_health })
-          setRefreshedAtMs(Date.now())
-          setError(null)
-          setIsLoading(false)
-        })
-      } catch (loadError) {
-        if (cancelled) {
-          return
-        }
+      const previousSnapshot = snapshotRef.current?.overview.timeframe === selectedTimeframe
+        ? snapshotRef.current
+        : null
+      const failedSections: string[] = []
 
+      if (overviewResult.status === 'rejected') {
+        failedSections.push('overview')
+      }
+      if (candlesResult.status === 'rejected') {
+        failedSections.push('candles')
+      }
+      if (scenariosResult.status === 'rejected') {
+        failedSections.push('scenario history')
+      }
+      if (alertsResult.status === 'rejected') {
+        failedSections.push('alerts')
+      }
+      if (sourceHealthResult.status === 'rejected') {
+        failedSections.push('source health')
+      }
+
+      const overview = overviewResult.status === 'fulfilled'
+        ? overviewResult.value
+        : previousSnapshot?.overview
+
+      if (!overview) {
+        setSnapshot(null)
+        snapshotRef.current = null
+        setError(`Dashboard overview is unavailable. Failed sections: ${failedSections.join(', ') || 'overview'}.`)
+        setIsLoading(false)
+        isFirstLoad = false
+        return
+      }
+
+      const nextSnapshot: DashboardSnapshot = {
+        overview,
+        candles: candlesResult.status === 'fulfilled'
+          ? candlesResult.value
+          : previousSnapshot?.candles ?? [],
+        scenarios: scenariosResult.status === 'fulfilled'
+          ? scenariosResult.value
+          : previousSnapshot?.scenarios ?? [],
+        alerts: alertsResult.status === 'fulfilled'
+          ? alertsResult.value
+          : previousSnapshot?.alerts ?? [],
+        source_health: sourceHealthResult.status === 'fulfilled'
+          ? sourceHealthResult.value
+          : previousSnapshot?.source_health ?? [],
+      }
+
+      snapshotRef.current = nextSnapshot
+      startTransition(() => {
+        setSnapshot(nextSnapshot)
+        setRefreshedAtMs(Date.now())
         setError(
-          loadError instanceof Error
-            ? loadError.message
-            : 'Dashboard data could not be loaded.',
+          failedSections.length > 0
+            ? `Refresh incomplete for ${failedSections.join(', ')}. Last successful values are shown where available.`
+            : null,
         )
         setIsLoading(false)
-      }
+      })
 
       isFirstLoad = false
     }
@@ -772,7 +815,7 @@ function App() {
         </article>
       </section>
 
-      {error ? <div className="error-banner">Latest refresh failed: {error}</div> : null}
+      {error ? <div className="error-banner">Dashboard refresh: {error}</div> : null}
     </main>
   )
 }
