@@ -407,12 +407,57 @@ pub mod adapters {
     pub struct KrakenMarketDataAdapter;
 
     impl KrakenMarketDataAdapter {
+        pub fn rest_client(self) -> RestMarketDataClient {
+            RestMarketDataClient::new("https://api.kraken.com")
+        }
+
+        pub fn ticker_path(self) -> &'static str {
+            "/0/public/Ticker"
+        }
+
         pub fn ohlc_path(self) -> &'static str {
             "/0/public/OHLC"
         }
 
         pub fn ticker_channel(self) -> &'static str {
             "ticker"
+        }
+
+        pub fn build_reference_price_request(self, pair: &str) -> RestRequest {
+            RestRequest {
+                path: self.ticker_path(),
+                query: vec![("pair".to_owned(), pair.to_owned())],
+            }
+        }
+
+        pub fn parse_reference_price_response(self, payload: &str) -> Result<Price, String> {
+            let document = parse_json(payload)?;
+            let errors = document
+                .get("error")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing Kraken error field".to_owned())?;
+            if !errors.is_empty() {
+                return Err(format!("Kraken ticker request returned errors: {errors}"));
+            }
+
+            let result = document
+                .get("result")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "missing Kraken ticker result".to_owned())?;
+            let ticker = result
+                .values()
+                .next()
+                .ok_or_else(|| "Kraken ticker result is empty".to_owned())?;
+            let last_trade = ticker
+                .get("c")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing Kraken last trade price".to_owned())?
+                .parse::<f64>()
+                .map_err(|error| format!("invalid Kraken last trade price: {error}"))?;
+
+            Price::new(last_trade).map_err(str::to_owned)
         }
     }
 
@@ -569,7 +614,7 @@ fn parse_array_i64(value: &Value, index: usize) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::adapters::{BinanceMarketDataAdapter, BinanceStreamEvent};
+    use super::adapters::{BinanceMarketDataAdapter, BinanceStreamEvent, KrakenMarketDataAdapter};
     use super::clients::{StreamSubscription, WebSocketMarketDataClient};
     use super::health::{SourceHealthMonitor, SourceStatus};
     use super::normalization::SymbolMapper;
@@ -658,6 +703,53 @@ mod tests {
             .expect("price response should parse");
 
         assert_eq!(price.0, 68_450.12);
+    }
+
+    #[test]
+    fn builds_kraken_reference_price_request() {
+        let adapter = KrakenMarketDataAdapter;
+        let request = adapter.build_reference_price_request("XBTUSD");
+
+        assert_eq!(request.path, "/0/public/Ticker");
+        assert_eq!(request.query_value("pair"), Some("XBTUSD"));
+        assert_eq!(
+            adapter.rest_client().build_url(&request),
+            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
+        );
+    }
+
+    #[test]
+    fn parses_kraken_reference_price_response() {
+        let adapter = KrakenMarketDataAdapter;
+        let price = adapter
+            .parse_reference_price_response(
+                r#"{
+                    "error":[],
+                    "result":{
+                        "XXBTZUSD":{
+                            "a":["68460.1","1","1.000"],
+                            "b":["68450.1","1","1.000"],
+                            "c":["68455.12","0.001"],
+                            "v":["100.0","200.0"]
+                        }
+                    }
+                }"#,
+            )
+            .expect("Kraken ticker response should parse");
+
+        assert_eq!(price.0, 68_455.12);
+    }
+
+    #[test]
+    fn rejects_kraken_reference_price_errors() {
+        let adapter = KrakenMarketDataAdapter;
+        let error = adapter
+            .parse_reference_price_response(
+                r#"{"error":["EQuery:Unknown asset pair"],"result":{}}"#,
+            )
+            .expect_err("Kraken ticker errors should be surfaced");
+
+        assert!(error.contains("Unknown asset pair"));
     }
 
     #[test]
