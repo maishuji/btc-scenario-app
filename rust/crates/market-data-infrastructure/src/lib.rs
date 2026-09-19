@@ -437,7 +437,7 @@ pub mod adapters {
                 .and_then(Value::as_array)
                 .ok_or_else(|| "missing Kraken error field".to_owned())?;
             if !errors.is_empty() {
-                return Err(format!("Kraken ticker request returned errors: {errors}"));
+                return Err(format!("Kraken ticker request returned errors: {errors:?}"));
             }
 
             let result = document
