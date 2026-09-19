@@ -13,6 +13,7 @@ The matrix is intentionally limited to the sources already chosen for the MVP:
 - Binance as the primary live spot source
 - Kraken as the secondary validation source
 - CoinGecko as the reference and fallback source
+- Deribit as the read-only derivatives reference source
 
 The focus is BTC spot only.
 
@@ -222,6 +223,26 @@ Use these Kraken feeds in the first implementation:
 - WebSocket `ticker` channel for `BTC/USD`
 
 Do not mirror the full Binance ingestion footprint on Kraken in the MVP.
+
+## Deribit Endpoint Matrix
+
+Deribit is used as a read-only derivatives reference for the BTC dashboard. It does not replace Binance as the canonical spot source and does not drive automated trading.
+
+### REST Endpoint
+
+#### Perpetual Ticker
+
+- Endpoint: `GET /api/v2/public/ticker`
+- Base URL: `https://www.deribit.com`
+- Example query:
+  - `instrument_name=BTC-PERPETUAL`
+- MVP usage:
+  - Persist the latest index price, mark price, open interest, and 8-hour funding rate
+  - Surface derivatives freshness and availability through source health
+- Priority:
+  - Medium
+
+The application keeps the canonical instrument as `BTC-USD-SPOT`; `BTC-PERPETUAL` is stored as the external Deribit instrument name on each derivatives snapshot.
 
 ## CoinGecko Endpoint Matrix
 

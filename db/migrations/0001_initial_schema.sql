@@ -58,6 +58,23 @@ CREATE TABLE IF NOT EXISTS live_price_snapshots (
     CHECK (volume_24h >= 0.0)
 );
 
+CREATE TABLE IF NOT EXISTS derivatives_snapshots (
+    id TEXT PRIMARY KEY,
+    instrument_id TEXT NOT NULL REFERENCES instruments(id),
+    source_id TEXT NOT NULL REFERENCES data_sources(id),
+    instrument_name TEXT NOT NULL,
+    index_price REAL NOT NULL,
+    mark_price REAL NOT NULL,
+    open_interest REAL NOT NULL,
+    funding_rate REAL NOT NULL,
+    observed_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    CHECK (index_price >= 0.0),
+    CHECK (mark_price >= 0.0),
+    CHECK (open_interest >= 0.0),
+    UNIQUE (instrument_id, source_id, instrument_name, observed_at_ms)
+);
+
 CREATE TABLE IF NOT EXISTS feature_snapshots (
     id TEXT PRIMARY KEY,
     instrument_id TEXT NOT NULL REFERENCES instruments(id),
@@ -192,5 +209,9 @@ INSERT INTO data_sources (
 VALUES
     ('binance', 'Binance', 'exchange', 1, 1, 0, 0),
     ('kraken', 'Kraken', 'exchange', 0, 1, 0, 0),
-    ('coingecko', 'CoinGecko', 'reference', 0, 1, 0, 0)
+    ('coingecko', 'CoinGecko', 'reference', 0, 1, 0, 0),
+    ('deribit', 'Deribit', 'exchange', 0, 1, 0, 0)
 ON CONFLICT(id) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS idx_derivatives_snapshots_instrument_observed_at
+    ON derivatives_snapshots (instrument_id, observed_at_ms DESC);

@@ -1,4 +1,5 @@
 use market_data_core::candle::Candle;
+use market_data_core::derivatives::DerivativesSnapshot;
 use market_data_core::snapshot::LivePriceSnapshot;
 use scenario_core::{FeatureSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
@@ -15,7 +16,14 @@ pub fn scenario_snapshot_id(snapshot: &ScenarioSnapshot) -> String {
 pub mod models {
     use market_data_core::timeframe::Timeframe;
 
-    use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
+    use super::{
+        Candle,
+        DerivativesSnapshot,
+        FeatureSnapshot,
+        LivePriceSnapshot,
+        MarketRegimeSnapshot,
+        ScenarioSnapshot,
+    };
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct CandleRecord {
@@ -30,6 +38,11 @@ pub mod models {
     #[derive(Debug, Clone, PartialEq)]
     pub struct LivePriceSnapshotRecord {
         pub snapshot: LivePriceSnapshot,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DerivativesSnapshotRecord {
+        pub snapshot: DerivativesSnapshot,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -82,7 +95,14 @@ pub mod repositories {
     use market_data_core::timeframe::Timeframe;
 
     use super::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
-    use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
+    use super::{
+        Candle,
+        DerivativesSnapshot,
+        FeatureSnapshot,
+        LivePriceSnapshot,
+        MarketRegimeSnapshot,
+        ScenarioSnapshot,
+    };
 
     pub trait CandleRepository {
         type Error;
@@ -100,6 +120,12 @@ pub mod repositories {
         type Error;
 
         fn save(&self, snapshot: &LivePriceSnapshot) -> Result<(), Self::Error>;
+    }
+
+    pub trait DerivativesSnapshotRepository {
+        type Error;
+
+        fn save(&self, snapshot: &DerivativesSnapshot) -> Result<(), Self::Error>;
     }
 
     pub trait RegimeSnapshotRepository {
@@ -174,6 +200,15 @@ pub mod repositories {
 
         fn load_source_health(&self) -> Result<Vec<super::models::SourceHealthSnapshot>, Self::Error>;
     }
+
+    pub trait LatestDerivativesSnapshotQueryRepository {
+        type Error;
+
+        fn load_latest_derivatives_snapshot(
+            &self,
+            instrument_id: &str,
+        ) -> Result<Option<super::models::DerivativesSnapshotRecord>, Self::Error>;
+    }
 }
 
 pub mod sqlite {
@@ -185,6 +220,7 @@ pub mod sqlite {
     use super::models::{
         AlertRecord,
         CandleRecord,
+        DerivativesSnapshotRecord,
         LatestMarketOverviewRecord,
         ScenarioSnapshotRecord,
         SourceHealthRecord,
@@ -195,7 +231,9 @@ pub mod sqlite {
         AlertRepository,
         CandleHistoryQueryRepository,
         CandleRepository,
+        DerivativesSnapshotRepository,
         FeatureSnapshotRepository,
+        LatestDerivativesSnapshotQueryRepository,
         LivePriceSnapshotRepository,
         MarketOverviewQueryRepository,
         RegimeSnapshotRepository,
@@ -204,7 +242,10 @@ pub mod sqlite {
         SourceHealthQueryRepository,
         SourceHealthRepository,
     };
-    use super::{Candle, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
+    use super::{
+        Candle, DerivativesSnapshot, FeatureSnapshot, LivePriceSnapshot, MarketRegimeSnapshot,
+        ScenarioSnapshot,
+    };
     use market_data_core::timeframe::Timeframe;
     use market_data_core::value_objects::{Price, Timestamp, Volume};
     use scenario_core::{ExpectedDirection, MarketRegimeLabel};
@@ -379,6 +420,45 @@ pub mod sqlite {
             let mut alerts = rows.collect::<Result<Vec<_>, _>>()?;
             alerts.reverse();
             Ok(alerts)
+        }
+
+        pub fn load_latest_derivatives_snapshot(
+            &self,
+            instrument_id: &str,
+        ) -> Result<Option<DerivativesSnapshotRecord>, rusqlite::Error> {
+            self.connection
+                .borrow()
+                .query_row(
+                    "SELECT
+                        instrument_id,
+                        source_id,
+                        instrument_name,
+                        index_price,
+                        mark_price,
+                        open_interest,
+                        funding_rate,
+                        observed_at_ms
+                     FROM derivatives_snapshots
+                     WHERE instrument_id = ?1
+                     ORDER BY observed_at_ms DESC
+                     LIMIT 1",
+                    params![instrument_id],
+                    |row| {
+                        Ok(DerivativesSnapshotRecord {
+                            snapshot: DerivativesSnapshot {
+                                instrument_id: row.get(0)?,
+                                source_id: row.get(1)?,
+                                instrument_name: row.get(2)?,
+                                index_price: Price::new(row.get(3)?).map_err(sqlite_mapping_error)?,
+                                mark_price: Price::new(row.get(4)?).map_err(sqlite_mapping_error)?,
+                                open_interest: row.get(5)?,
+                                funding_rate: row.get(6)?,
+                                observed_at: Timestamp::new(row.get(7)?).map_err(sqlite_mapping_error)?,
+                            },
+                        })
+                    },
+                )
+                .optional()
         }
 
         pub fn load_source_health_snapshots(&self) -> Result<Vec<SourceHealthSnapshot>, rusqlite::Error> {
@@ -844,6 +924,49 @@ pub mod sqlite {
         }
     }
 
+    impl DerivativesSnapshotRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn save(&self, snapshot: &DerivativesSnapshot) -> Result<(), Self::Error> {
+            let identifier = format!(
+                "{}:{}:{}:{}:{}",
+                snapshot.instrument_id,
+                snapshot.source_id,
+                snapshot.instrument_name,
+                snapshot.observed_at.0,
+                "v1"
+            );
+            self.connection.borrow().execute(
+                "INSERT OR REPLACE INTO derivatives_snapshots (
+                    id,
+                    instrument_id,
+                    source_id,
+                    instrument_name,
+                    index_price,
+                    mark_price,
+                    open_interest,
+                    funding_rate,
+                    observed_at_ms,
+                    created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    identifier,
+                    snapshot.instrument_id,
+                    snapshot.source_id,
+                    snapshot.instrument_name,
+                    snapshot.index_price.0,
+                    snapshot.mark_price.0,
+                    snapshot.open_interest,
+                    snapshot.funding_rate,
+                    snapshot.observed_at.0,
+                    snapshot.observed_at.0,
+                ],
+            )?;
+
+            Ok(())
+        }
+    }
+
     impl FeatureSnapshotRepository for SqliteMarketDataStore {
         type Error = rusqlite::Error;
 
@@ -1135,6 +1258,17 @@ pub mod sqlite {
             self.load_source_health_snapshots()
         }
     }
+
+    impl LatestDerivativesSnapshotQueryRepository for SqliteMarketDataStore {
+        type Error = rusqlite::Error;
+
+        fn load_latest_derivatives_snapshot(
+            &self,
+            instrument_id: &str,
+        ) -> Result<Option<DerivativesSnapshotRecord>, Self::Error> {
+            self.load_latest_derivatives_snapshot(instrument_id)
+        }
+    }
 }
 
 pub mod queries {
@@ -1143,6 +1277,7 @@ pub mod queries {
     use super::models::{
         AlertRecord,
         CandleRecord,
+        DerivativesSnapshotRecord,
         LatestMarketOverviewRecord,
         ScenarioSnapshotRecord,
         SourceHealthSnapshot,
@@ -1150,6 +1285,7 @@ pub mod queries {
     use super::repositories::{
         AlertHistoryQueryRepository,
         CandleHistoryQueryRepository,
+        LatestDerivativesSnapshotQueryRepository,
         MarketOverviewQueryRepository,
         ScenarioHistoryQueryRepository,
         SourceHealthQueryRepository,
@@ -1295,6 +1431,35 @@ pub mod queries {
             repository.load_source_health()
         }
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct LatestDerivativesSnapshotQuery {
+        pub instrument_id: String,
+    }
+
+    impl LatestDerivativesSnapshotQuery {
+        pub fn for_instrument(instrument_id: impl Into<String>) -> Self {
+            Self {
+                instrument_id: instrument_id.into(),
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct LatestDerivativesSnapshotQueryService;
+
+    impl LatestDerivativesSnapshotQueryService {
+        pub fn load_latest<R>(
+            self,
+            repository: &R,
+            query: &LatestDerivativesSnapshotQuery,
+        ) -> Result<Option<DerivativesSnapshotRecord>, R::Error>
+        where
+            R: LatestDerivativesSnapshotQueryRepository,
+        {
+            repository.load_latest_derivatives_snapshot(&query.instrument_id)
+        }
+    }
 }
 
 pub mod writes {
@@ -1330,6 +1495,7 @@ pub mod writes {
 
 #[cfg(test)]
 mod tests {
+    use market_data_core::derivatives::DerivativesSnapshot;
     use market_data_core::snapshot::LivePriceSnapshot;
     use market_data_core::timeframe::Timeframe;
     use market_data_core::value_objects::{Price, Timestamp, Volume};
@@ -1349,6 +1515,7 @@ mod tests {
         AlertRepository,
         CandleHistoryQueryRepository,
         CandleRepository,
+        DerivativesSnapshotRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
         MarketOverviewQueryRepository,
@@ -1357,6 +1524,7 @@ mod tests {
         ScenarioSnapshotRepository,
         SourceHealthQueryRepository,
         SourceHealthRepository,
+        LatestDerivativesSnapshotQueryRepository,
     };
     use super::sqlite::SqliteMarketDataStore;
     use super::Candle;
@@ -1388,6 +1556,7 @@ mod tests {
                     'data_sources',
                     'candles',
                     'live_price_snapshots',
+                    'derivatives_snapshots',
                     'feature_snapshots',
                     'regime_snapshots',
                     'scenario_snapshots',
@@ -1399,7 +1568,7 @@ mod tests {
             )
             .expect("table count query should succeed");
 
-        assert_eq!(table_count, 9);
+        assert_eq!(table_count, 10);
     }
 
     #[test]
@@ -1421,7 +1590,7 @@ mod tests {
             .expect("seeded data sources should exist");
 
         assert_eq!(instrument_symbol, "BTC-USD-SPOT");
-        assert_eq!(source_count, 3);
+        assert_eq!(source_count, 4);
     }
 
     #[test]
@@ -1513,6 +1682,39 @@ mod tests {
             .expect("live price snapshot should save");
 
         assert_eq!(store.count_rows("live_price_snapshots").unwrap(), 1);
+    }
+
+    #[test]
+    fn sqlite_store_saves_and_loads_latest_derivatives_snapshot() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let snapshot = DerivativesSnapshot {
+            instrument_id: "BTC-USD-SPOT".to_owned(),
+            source_id: "deribit".to_owned(),
+            instrument_name: "BTC-PERPETUAL".to_owned(),
+            index_price: Price::new(68_450.12).unwrap(),
+            mark_price: Price::new(68_455.20).unwrap(),
+            open_interest: 12_345.6,
+            funding_rate: 0.0001,
+            observed_at: Timestamp::new(1_710_000_000_000).unwrap(),
+        };
+
+        DerivativesSnapshotRepository::save(&store, &snapshot)
+            .expect("derivatives snapshot should save");
+
+        let latest = LatestDerivativesSnapshotQueryRepository::load_latest_derivatives_snapshot(
+            &store,
+            "BTC-USD-SPOT",
+        )
+        .expect("latest derivatives snapshot should load")
+        .expect("latest derivatives snapshot should exist");
+
+        assert_eq!(store.count_rows("derivatives_snapshots").unwrap(), 1);
+        assert_eq!(latest.snapshot.source_id, "deribit");
+        assert_eq!(latest.snapshot.instrument_name, "BTC-PERPETUAL");
+        assert_eq!(latest.snapshot.mark_price.0, 68_455.20);
+        assert_eq!(latest.snapshot.open_interest, 12_345.6);
     }
 
     #[test]
