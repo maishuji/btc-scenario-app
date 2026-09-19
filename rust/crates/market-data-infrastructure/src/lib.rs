@@ -173,9 +173,17 @@ pub mod clients {
 }
 
 pub mod adapters {
-    use super::clients::{RestMarketDataClient, RestRequest, StreamSubscription, WebSocketMarketDataClient};
-    use super::{parse_array_f64, parse_array_i64, parse_json, parse_string_bool, parse_string_f64, parse_string_i64};
-    use super::{Candle, Instrument, LivePriceSnapshot, Price, Timeframe, Timestamp, Volume, Value};
+    use super::clients::{
+        RestMarketDataClient, RestRequest, StreamSubscription, WebSocketMarketDataClient,
+    };
+    use super::{
+        Candle, Instrument, LivePriceSnapshot, Price, Timeframe, Timestamp, Value, Volume,
+    };
+    use super::{
+        parse_array_f64, parse_array_i64, parse_integer, parse_json, parse_number, parse_string,
+        parse_string_bool, parse_string_f64, parse_string_i64,
+    };
+    use market_data_core::derivatives::DerivativesSnapshot;
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum BinanceStreamEvent {
@@ -473,6 +481,67 @@ pub mod adapters {
             "/api/v3/coins/markets"
         }
     }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct DeribitMarketDataAdapter;
+
+    impl DeribitMarketDataAdapter {
+        pub fn rest_client(self) -> RestMarketDataClient {
+            RestMarketDataClient::new("https://www.deribit.com")
+        }
+
+        pub fn ticker_path(self) -> &'static str {
+            "/api/v2/public/ticker"
+        }
+
+        pub fn build_ticker_request(self, instrument_name: &str) -> RestRequest {
+            RestRequest {
+                path: self.ticker_path(),
+                query: vec![("instrument_name".to_owned(), instrument_name.to_owned())],
+            }
+        }
+
+        pub fn parse_ticker_response(
+            self,
+            instrument: &Instrument,
+            payload: &str,
+        ) -> Result<DerivativesSnapshot, String> {
+            let document = parse_json(payload)?;
+            let result = document
+                .get("result")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    document
+                        .get("error")
+                        .map(|error| format!("Deribit ticker request returned error: {error}"))
+                        .unwrap_or_else(|| "missing Deribit ticker result".to_owned())
+                })?;
+
+            let index_price =
+                Price::new(parse_number(result, "index_price")?).map_err(str::to_owned)?;
+            let mark_price =
+                Price::new(parse_number(result, "mark_price")?).map_err(str::to_owned)?;
+            let open_interest = parse_number(result, "open_interest")?;
+            if open_interest < 0.0 {
+                return Err("open interest must be non-negative".to_owned());
+            }
+
+            let funding_rate = parse_number(result, "funding_8h")?;
+            let observed_at =
+                Timestamp::new(parse_integer(result, "timestamp")?).map_err(str::to_owned)?;
+
+            Ok(DerivativesSnapshot {
+                instrument_id: instrument.id.clone(),
+                source_id: "deribit".to_owned(),
+                instrument_name: parse_string(result, "instrument_name")?.to_owned(),
+                index_price,
+                mark_price,
+                open_interest,
+                funding_rate,
+                observed_at,
+            })
+        }
+    }
 }
 
 pub mod normalization {
@@ -596,6 +665,31 @@ fn parse_string_bool(value: &Value, field: &str) -> Result<bool, String> {
         .ok_or_else(|| format!("missing boolean field: {field}"))
 }
 
+fn parse_string<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a str, String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string field: {field}"))
+}
+
+fn parse_number(value: &serde_json::Map<String, Value>, field: &str) -> Result<f64, String> {
+    value
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("missing finite number field: {field}"))
+}
+
+fn parse_integer(value: &serde_json::Map<String, Value>, field: &str) -> Result<i64, String> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("missing integer field: {field}"))
+}
+
 fn parse_array_f64(value: &Value, index: usize) -> Result<f64, String> {
     value
         .get(index)
@@ -614,7 +708,10 @@ fn parse_array_i64(value: &Value, index: usize) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::adapters::{BinanceMarketDataAdapter, BinanceStreamEvent, KrakenMarketDataAdapter};
+    use super::adapters::{
+        BinanceMarketDataAdapter, BinanceStreamEvent, DeribitMarketDataAdapter,
+        KrakenMarketDataAdapter,
+    };
     use super::clients::{StreamSubscription, WebSocketMarketDataClient};
     use super::health::{SourceHealthMonitor, SourceStatus};
     use super::normalization::SymbolMapper;
@@ -750,6 +847,65 @@ mod tests {
             .expect_err("Kraken ticker errors should be surfaced");
 
         assert!(error.contains("Unknown asset pair"));
+    }
+
+    #[test]
+    fn builds_deribit_ticker_request() {
+        let adapter = DeribitMarketDataAdapter;
+        let request = adapter.build_ticker_request("BTC-PERPETUAL");
+
+        assert_eq!(request.path, "/api/v2/public/ticker");
+        assert_eq!(
+            request.query_value("instrument_name"),
+            Some("BTC-PERPETUAL")
+        );
+        assert_eq!(
+            adapter.rest_client().build_url(&request),
+            "https://www.deribit.com/api/v2/public/ticker?instrument_name=BTC-PERPETUAL"
+        );
+    }
+
+    #[test]
+    fn parses_deribit_derivatives_snapshot() {
+        let adapter = DeribitMarketDataAdapter;
+        let snapshot = adapter
+            .parse_ticker_response(
+                &Instrument::btc_usd_spot(),
+                r#"{
+                    "jsonrpc":"2.0",
+                    "result":{
+                        "instrument_name":"BTC-PERPETUAL",
+                        "index_price":68450.12,
+                        "mark_price":68455.20,
+                        "open_interest":12345.6,
+                        "funding_8h":0.0001,
+                        "timestamp":1710000000000
+                    }
+                }"#,
+            )
+            .expect("Deribit ticker response should parse");
+
+        assert_eq!(snapshot.instrument_id, "BTC-USD-SPOT");
+        assert_eq!(snapshot.source_id, "deribit");
+        assert_eq!(snapshot.instrument_name, "BTC-PERPETUAL");
+        assert_eq!(snapshot.index_price.0, 68_450.12);
+        assert_eq!(snapshot.mark_price.0, 68_455.20);
+        assert_eq!(snapshot.open_interest, 12_345.6);
+        assert_eq!(snapshot.funding_rate, 0.0001);
+        assert_eq!(snapshot.observed_at.0, 1_710_000_000_000);
+    }
+
+    #[test]
+    fn rejects_deribit_ticker_errors() {
+        let adapter = DeribitMarketDataAdapter;
+        let error = adapter
+            .parse_ticker_response(
+                &Instrument::btc_usd_spot(),
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params"}}"#,
+            )
+            .expect_err("Deribit ticker errors should be surfaced");
+
+        assert!(error.contains("Invalid params"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ The Rust workspace now covers the main backend MVP path for a BTC-first scenario
 - A frontend dashboard shell renders market overview, chart context, scenario history, and alerts.
 - Alerts and scenario history can drive chart projections in the frontend.
 - Binance source health events are persisted and exposed with dynamic freshness status.
+- Deribit BTC perpetual derivatives snapshots are parsed, persisted, and exposed as a read-only API view.
 - The frontend shows source status and feed age alongside the market overview.
 - Local development can start the API and frontend together with `npm run dev` from the repo root.
 - The API currently exposes:
@@ -23,6 +24,7 @@ The Rust workspace now covers the main backend MVP path for a BTC-first scenario
   - `GET /api/scenario-history?timeframe=1m&limit=...`
   - `GET /api/alerts?limit=...`
   - `GET /api/source-health`
+  - `GET /api/derivatives`
 
 Recent completed commits:
 
@@ -40,7 +42,24 @@ Recent completed commits:
 
 The next work should stay focused on making the system usable by a frontend without widening into new data sources too early.
 
-### 1. Add Secondary Source Validation
+### 1. Make Derivatives Context Visible in the Dashboard
+
+Goal:
+
+- Show the latest Deribit index price, mark price, open interest, and funding rate alongside the BTC overview.
+
+Why next:
+
+- The backend now persists a read-only derivatives snapshot, but the frontend does not consume it yet.
+- A small derivatives panel adds context without changing the canonical spot workflow or introducing trading behavior.
+
+Recommended scope:
+
+- Load `/api/derivatives` independently from the market overview.
+- Preserve the last successful derivatives panel when refreshes fail.
+- Show a compact unavailable or stale state from `/api/source-health`.
+
+### 2. Add Secondary Source Validation
 
 Goal:
 
@@ -61,7 +80,7 @@ Suggested first version:
 
 - Keep the validation path read-only and scoped to BTC spot.
 
-### 2. Harden Partial Failures
+### 3. Harden Partial Failures
 
 Goal:
 
@@ -76,7 +95,7 @@ Possible directions:
 - Load dashboard endpoints independently.
 - Preserve the last successful snapshot while showing a degraded banner.
 
-### 3. Enrich Alert Metadata
+### 4. Enrich Alert Metadata
 
 Goal:
 
@@ -94,14 +113,14 @@ Recommended scope:
 
 ## Suggested Tomorrow Starting Point
 
-If the goal is steady MVP progress, start with secondary source validation.
+If the goal is steady MVP progress, start by adding the derivatives panel to the dashboard.
 
 Concrete next task:
 
-1. Add a read-only Kraken BTC/USD reference-price adapter.
-2. Compare it with the latest Binance snapshot during periodic sync.
-3. Persist divergence as a source-health event.
-4. Validate with crate-scoped tests, `npm run build`, and `cargo test --workspace`.
+1. Load the latest derivatives snapshot from `/api/derivatives`.
+2. Add a compact derivatives context panel to the dashboard.
+3. Keep derivatives refreshes independent from the primary market overview.
+4. Validate with the frontend build, crate-scoped tests, and `cargo test --workspace` when a Rust 2024-compatible toolchain is available.
 
 ## Relevant Files To Open First Tomorrow
 

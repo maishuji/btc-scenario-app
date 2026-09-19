@@ -64,6 +64,14 @@ pub mod source {
                 source_type: SourceType::Reference,
             }
         }
+
+        pub fn deribit() -> Self {
+            Self {
+                id: "deribit".to_owned(),
+                name: "Deribit".to_owned(),
+                source_type: SourceType::Exchange,
+            }
+        }
     }
 }
 
@@ -215,6 +223,22 @@ pub mod snapshot {
         pub last_price: Price,
         pub price_change_24h: f64,
         pub volume_24h: Volume,
+        pub observed_at: Timestamp,
+    }
+}
+
+pub mod derivatives {
+    use crate::value_objects::{Price, Timestamp};
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DerivativesSnapshot {
+        pub instrument_id: String,
+        pub source_id: String,
+        pub instrument_name: String,
+        pub index_price: Price,
+        pub mark_price: Price,
+        pub open_interest: f64,
+        pub funding_rate: f64,
         pub observed_at: Timestamp,
     }
 }

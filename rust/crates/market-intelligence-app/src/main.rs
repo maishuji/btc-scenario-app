@@ -9,6 +9,7 @@ mod config {
         pub api_sync_interval_secs: u64,
         pub source_health_stale_after_secs: u64,
         pub kraken_max_divergence_basis_points: u64,
+        pub deribit_instrument_name: String,
     }
 
     impl Default for AppConfig {
@@ -22,6 +23,7 @@ mod config {
                 api_sync_interval_secs: 30,
                 source_health_stale_after_secs: 90,
                 kraken_max_divergence_basis_points: 100,
+                deribit_instrument_name: "BTC-PERPETUAL".to_owned(),
             }
         }
     }
@@ -42,7 +44,13 @@ mod api {
     use axum::{Json, Router};
     use market_data_core::timeframe::Timeframe;
     use market_data_infrastructure::health::{SourceHealthMonitor, SourceStatus};
-    use persistence_core::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use persistence_core::models::{
+        AlertRecord,
+        CandleRecord,
+        DerivativesSnapshotRecord,
+        LatestMarketOverviewRecord,
+        ScenarioSnapshotRecord,
+    };
     use persistence_core::scenario_snapshot_id;
     use persistence_core::queries::{
         AlertHistoryQuery,
@@ -55,6 +63,8 @@ mod api {
         ScenarioHistoryQueryService,
         SourceHealthQuery,
         SourceHealthQueryService,
+        LatestDerivativesSnapshotQuery,
+        LatestDerivativesSnapshotQueryService,
     };
     use persistence_core::sqlite::SqliteMarketDataStore;
     use serde::{Deserialize, Serialize};
@@ -255,6 +265,33 @@ mod api {
         pub age_ms: Option<i64>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct DerivativesSnapshotResponse {
+        pub instrument_id: String,
+        pub source_id: String,
+        pub instrument_name: String,
+        pub index_price: f64,
+        pub mark_price: f64,
+        pub open_interest: f64,
+        pub funding_rate: f64,
+        pub observed_at_ms: i64,
+    }
+
+    impl DerivativesSnapshotResponse {
+        fn from_record(record: DerivativesSnapshotRecord) -> Self {
+            Self {
+                instrument_id: record.snapshot.instrument_id,
+                source_id: record.snapshot.source_id,
+                instrument_name: record.snapshot.instrument_name,
+                index_price: record.snapshot.index_price.0,
+                mark_price: record.snapshot.mark_price.0,
+                open_interest: record.snapshot.open_interest,
+                funding_rate: record.snapshot.funding_rate,
+                observed_at_ms: record.snapshot.observed_at.0,
+            }
+        }
+    }
+
     pub fn build_router(state: ApiState) -> Router {
         Router::new()
             .route("/api/market-overview", get(get_market_overview))
@@ -262,6 +299,7 @@ mod api {
             .route("/api/scenario-history", get(get_scenario_history))
             .route("/api/alerts", get(get_alerts))
             .route("/api/source-health", get(get_source_health))
+            .route("/api/derivatives", get(get_derivatives))
             .with_state(state)
     }
 
@@ -394,6 +432,19 @@ mod api {
         ))
     }
 
+    pub async fn get_derivatives(
+        State(state): State<ApiState>,
+    ) -> Result<Json<DerivativesSnapshotResponse>, StatusCode> {
+        let store = open_store(&state)?;
+        let query = LatestDerivativesSnapshotQuery::for_instrument(state.instrument_id);
+        let snapshot = LatestDerivativesSnapshotQueryService
+            .load_latest(&store, &query)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+        Ok(Json(DerivativesSnapshotResponse::from_record(snapshot)))
+    }
+
     fn open_store(state: &ApiState) -> Result<SqliteMarketDataStore, StatusCode> {
         let store = SqliteMarketDataStore::open(&state.market_data_db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -453,17 +504,20 @@ mod tasks {
     use std::path::Path;
 
     use crate::config::AppConfig;
+    use market_data_core::derivatives::DerivativesSnapshot;
     use market_data_core::instrument::Instrument;
     use market_data_core::snapshot::LivePriceSnapshot;
     use market_data_infrastructure::adapters::BinanceMarketDataAdapter;
     use market_data_infrastructure::adapters::BinanceStreamEvent;
     use market_data_infrastructure::adapters::KrakenMarketDataAdapter;
+    use market_data_infrastructure::adapters::DeribitMarketDataAdapter;
     use market_data_core::timeframe::Timeframe;
     use persistence_core::models::{AlertRecord, LatestMarketOverviewRecord};
     use persistence_core::queries::{LatestMarketOverviewQuery, MarketOverviewQueryService};
     use persistence_core::repositories::{
         AlertRepository,
         CandleRepository,
+        DerivativesSnapshotRepository,
         FeatureSnapshotRepository,
         LivePriceSnapshotRepository,
         RegimeSnapshotRepository,
@@ -522,6 +576,15 @@ mod tasks {
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct KrakenValidationTask;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DerivativesIngestionSummary {
+        pub status: SourceStatus,
+        pub snapshot: Option<DerivativesSnapshot>,
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct DeribitDerivativesIngestionTask;
 
     pub fn persist_source_health_event(
         store: &SqliteMarketDataStore,
@@ -653,6 +716,73 @@ mod tasks {
                 binance_price,
                 reference_price: Some(reference_price),
                 divergence_percent: Some(divergence_percent),
+            })
+        }
+    }
+
+    impl DeribitDerivativesIngestionTask {
+        pub fn ingest_latest_into_store(
+            self,
+            config: &AppConfig,
+            store: &SqliteMarketDataStore,
+        ) -> Result<DerivativesIngestionSummary, String> {
+            let adapter = DeribitMarketDataAdapter;
+            let request = adapter.build_ticker_request(&config.deribit_instrument_name);
+            let payload = match adapter.rest_client().execute_text(&request) {
+                Ok(response) => response.body,
+                Err(error) => {
+                    persist_source_health_event(
+                        store,
+                        "deribit",
+                        SourceStatus::Unavailable,
+                        format!("Deribit derivatives request failed: {error}"),
+                    )?;
+                    return Ok(DerivativesIngestionSummary {
+                        status: SourceStatus::Unavailable,
+                        snapshot: None,
+                    });
+                }
+            };
+
+            self.persist_payload(store, &payload)
+        }
+
+        pub fn persist_payload(
+            self,
+            store: &SqliteMarketDataStore,
+            payload: &str,
+        ) -> Result<DerivativesIngestionSummary, String> {
+            let instrument = Instrument::btc_usd_spot();
+            let snapshot = match DeribitMarketDataAdapter.parse_ticker_response(&instrument, payload) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    persist_source_health_event(
+                        store,
+                        "deribit",
+                        SourceStatus::Unavailable,
+                        format!("Deribit derivatives response was invalid: {error}"),
+                    )?;
+                    return Ok(DerivativesIngestionSummary {
+                        status: SourceStatus::Unavailable,
+                        snapshot: None,
+                    });
+                }
+            };
+
+            DerivativesSnapshotRepository::save(store, &snapshot).map_err(|error| error.to_string())?;
+            persist_source_health_event(
+                store,
+                "deribit",
+                SourceStatus::Healthy,
+                format!(
+                    "Deribit derivatives snapshot persisted for {}",
+                    snapshot.instrument_name
+                ),
+            )?;
+
+            Ok(DerivativesIngestionSummary {
+                status: SourceStatus::Healthy,
+                snapshot: Some(snapshot),
             })
         }
     }
@@ -984,6 +1114,7 @@ mod runtime {
         IngestionSummary,
         KrakenValidationTask,
         LiveSyncSummary,
+        DeribitDerivativesIngestionTask,
     };
     use market_data_infrastructure::health::{SourceHealthMonitor, SourceStatus};
 
@@ -1019,6 +1150,8 @@ mod runtime {
                     "Kraken reference validation skipped because no Binance snapshot is available",
                 )?;
             }
+
+            DeribitDerivativesIngestionTask.ingest_latest_into_store(&self.config, &store)?;
 
             Ok(RuntimeSummary {
                 bootstrap,
@@ -1163,13 +1296,19 @@ mod tests {
     use super::api::{
         get_alerts,
         get_candles,
+        get_derivatives,
         get_market_overview,
         get_scenario_history,
         get_source_health,
         ApiListQuery,
         ApiState,
     };
-    use super::tasks::{BinanceBootstrapIngestionTask, BinanceLiveSyncTask, KrakenValidationTask};
+    use super::tasks::{
+        BinanceBootstrapIngestionTask,
+        BinanceLiveSyncTask,
+        DeribitDerivativesIngestionTask,
+        KrakenValidationTask,
+    };
     use axum::extract::Query;
     use market_data_infrastructure::health::SourceStatus;
     use persistence_core::repositories::AlertHistoryQueryRepository;
@@ -1397,6 +1536,57 @@ mod tests {
     }
 
     #[test]
+    fn persists_healthy_deribit_derivatives_snapshot() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let summary = DeribitDerivativesIngestionTask
+            .persist_payload(
+                &store,
+                r#"{
+                    "jsonrpc":"2.0",
+                    "result":{
+                        "instrument_name":"BTC-PERPETUAL",
+                        "index_price":68450.12,
+                        "mark_price":68455.20,
+                        "open_interest":12345.6,
+                        "funding_8h":0.0001,
+                        "timestamp":1710000000000
+                    }
+                }"#,
+            )
+            .expect("Deribit ingestion should succeed");
+
+        assert_eq!(summary.status, SourceStatus::Healthy);
+        assert_eq!(summary.snapshot.as_ref().unwrap().source_id, "deribit");
+        assert_eq!(store.count_rows("derivatives_snapshots").unwrap(), 1);
+
+        let health = SourceHealthQueryRepository::load_source_health(&store)
+            .expect("Deribit health should load");
+        assert_eq!(health[0].latest_event.source_id, "deribit");
+        assert_eq!(health[0].latest_event.status, "healthy");
+    }
+
+    #[test]
+    fn records_unavailable_deribit_health_for_invalid_response() {
+        let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        let summary = DeribitDerivativesIngestionTask
+            .persist_payload(&store, r#"{"jsonrpc":"2.0","result":{}}"#)
+            .expect("invalid Deribit response should be recorded");
+
+        assert_eq!(summary.status, SourceStatus::Unavailable);
+        assert!(summary.snapshot.is_none());
+        assert_eq!(store.count_rows("derivatives_snapshots").unwrap(), 0);
+
+        let health = SourceHealthQueryRepository::load_source_health(&store)
+            .expect("Deribit health should load");
+        assert_eq!(health[0].latest_event.status, "unavailable");
+        assert!(health[0].latest_event.message.contains("invalid"));
+    }
+
+    #[test]
     fn generates_alerts_when_snapshot_state_changes() {
         let config = AppConfig::default();
         let store = SqliteMarketDataStore::open_in_memory().expect("sqlite store should open");
@@ -1535,6 +1725,46 @@ mod tests {
         .expect("api handler should return higher timeframe market overview");
 
         assert_eq!(higher_timeframe_response.0.timeframe, "5m");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn returns_latest_derivatives_snapshot_from_api_handler() {
+        let db_path = temp_db_path("derivatives-handler");
+        let config = AppConfig {
+            market_data_db_path: db_path.clone(),
+            ..AppConfig::default()
+        };
+        let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
+        store.apply_migrations().expect("migrations should apply");
+
+        DeribitDerivativesIngestionTask
+            .persist_payload(
+                &store,
+                r#"{
+                    "jsonrpc":"2.0",
+                    "result":{
+                        "instrument_name":"BTC-PERPETUAL",
+                        "index_price":68450.12,
+                        "mark_price":68455.20,
+                        "open_interest":12345.6,
+                        "funding_8h":0.0001,
+                        "timestamp":1710000000000
+                    }
+                }"#,
+            )
+            .expect("Deribit snapshot should persist");
+
+        let response = get_derivatives(State(ApiState::from_config(&config)))
+            .await
+            .expect("derivatives handler should return a snapshot");
+
+        assert_eq!(response.0.instrument_id, "BTC-USD-SPOT");
+        assert_eq!(response.0.source_id, "deribit");
+        assert_eq!(response.0.instrument_name, "BTC-PERPETUAL");
+        assert_eq!(response.0.index_price, 68_450.12);
+        assert_eq!(response.0.funding_rate, 0.0001);
 
         let _ = std::fs::remove_file(db_path);
     }
