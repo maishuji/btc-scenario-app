@@ -5,6 +5,7 @@ type MarketOverview = {
   instrument_id: string
   timeframe: string
   observed_at_ms: number
+  scenario_snapshot_id: string
   last_price: number
   price_change_24h: number
   volume_24h: number
@@ -47,6 +48,7 @@ type ScenarioHistoryEntry = {
   instrument_id: string
   timeframe: string
   observed_at_ms: number
+  scenario_snapshot_id: string
   bull_probability: number
   base_probability: number
   bear_probability: number
@@ -63,6 +65,7 @@ type AlertEntry = {
   severity: string
   message: string
   triggered_at_ms: number
+  scenario_snapshot_id: string | null
   is_acknowledged: boolean
 }
 
@@ -84,6 +87,7 @@ type DashboardSnapshot = {
 }
 
 type ProjectedScenario = {
+  scenario_snapshot_id: string
   observed_at_ms: number
   trigger_level: number
   invalidation_level: number
@@ -296,11 +300,15 @@ function formatAge(ageMs: number | null) {
   return `${Math.floor(ageMinutes / 60)}h ago`
 }
 
-function hasMatchingScenario(
+function findLinkedScenario(
   scenarios: ScenarioHistoryEntry[],
-  triggeredAtMs: number,
+  scenarioSnapshotId: string | null,
 ) {
-  return scenarios.some((scenario) => scenario.observed_at_ms === triggeredAtMs)
+  if (!scenarioSnapshotId) {
+    return undefined
+  }
+
+  return scenarios.find((scenario) => scenario.scenario_snapshot_id === scenarioSnapshotId)
 }
 
 function App() {
@@ -309,7 +317,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshedAtMs, setRefreshedAtMs] = useState<number | null>(null)
-  const [selectedScenarioObservedAtMs, setSelectedScenarioObservedAtMs] = useState<number | null>(null)
+  const [selectedScenarioId, setSelectedScenarioId] = useState<string | null>(null)
   const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>('1m')
 
   useEffect(() => {
@@ -411,7 +419,7 @@ function App() {
   }, [selectedTimeframe])
 
   useEffect(() => {
-    setSelectedScenarioObservedAtMs(null)
+    setSelectedScenarioId(null)
   }, [selectedTimeframe])
 
   if (isLoading && !snapshot) {
@@ -446,17 +454,18 @@ function App() {
   const bounds = chartBounds(candles)
   const lastCandle = candles[candles.length - 1]
   const selectedScenario = scenarios.find(
-    (scenario) => scenario.observed_at_ms === selectedScenarioObservedAtMs,
+    (scenario) => scenario.scenario_snapshot_id === selectedScenarioId,
   )
   const latestScenario = scenarios[scenarios.length - 1]
   const projectedScenario: ProjectedScenario = selectedScenario ?? latestScenario ?? {
+    scenario_snapshot_id: overview.scenario_snapshot_id,
     observed_at_ms: overview.observed_at_ms,
     trigger_level: overview.trigger_level,
     invalidation_level: overview.invalidation_level,
     expected_direction: overview.expected_direction,
     explanation: overview.explanation,
   }
-  const isHistoricalProjection = projectedScenario.observed_at_ms !== overview.observed_at_ms
+  const isHistoricalProjection = projectedScenario.scenario_snapshot_id !== overview.scenario_snapshot_id
   const extents = chartExtents(
     candles,
     projectedScenario,
@@ -732,7 +741,7 @@ function App() {
             <button
               type="button"
               className="ghost-button"
-              onClick={() => setSelectedScenarioObservedAtMs(null)}
+              onClick={() => setSelectedScenarioId(null)}
             >
               Follow latest
             </button>
@@ -741,10 +750,10 @@ function App() {
           <div className="timeline-list">
             {scenarios.map((scenario) => (
               <button
-                key={scenario.observed_at_ms}
+                key={scenario.scenario_snapshot_id}
                 type="button"
-                className={`timeline-item timeline-button${projectedScenario.observed_at_ms === scenario.observed_at_ms ? ' timeline-item-active' : ''}`}
-                onClick={() => setSelectedScenarioObservedAtMs(scenario.observed_at_ms)}
+                className={`timeline-item timeline-button${projectedScenario.scenario_snapshot_id === scenario.scenario_snapshot_id ? ' timeline-item-active' : ''}`}
+                onClick={() => setSelectedScenarioId(scenario.scenario_snapshot_id)}
               >
                 <div className="timeline-meta">
                   <span>{formatTimestamp(scenario.observed_at_ms)}</span>
@@ -777,16 +786,18 @@ function App() {
               <p className="empty-state">No alerts have been generated yet.</p>
             ) : (
               alerts.map((alert) => {
-                const canProjectScenario = hasMatchingScenario(scenarios, alert.triggered_at_ms)
+                const linkedScenario = findLinkedScenario(scenarios, alert.scenario_snapshot_id)
+                const canProjectScenario = linkedScenario !== undefined
+                const isProjected = linkedScenario?.scenario_snapshot_id === projectedScenario.scenario_snapshot_id
 
                 return (
                 <button
-                  key={`${alert.alert_type}-${alert.triggered_at_ms}`}
+                  key={`${alert.alert_type}-${alert.triggered_at_ms}-${alert.scenario_snapshot_id ?? 'unlinked'}`}
                   type="button"
-                  className={`timeline-item timeline-button${projectedScenario.observed_at_ms === alert.triggered_at_ms ? ' timeline-item-active' : ''}${!canProjectScenario ? ' timeline-item-muted' : ''}`}
+                  className={`timeline-item timeline-button${isProjected ? ' timeline-item-active' : ''}${!canProjectScenario ? ' timeline-item-muted' : ''}`}
                   onClick={() => {
-                    if (canProjectScenario) {
-                      setSelectedScenarioObservedAtMs(alert.triggered_at_ms)
+                    if (linkedScenario) {
+                      setSelectedScenarioId(linkedScenario.scenario_snapshot_id)
                     }
                   }}
                   disabled={!canProjectScenario}
@@ -800,7 +811,7 @@ function App() {
                     <span>{alert.alert_type.replace(/_/g, ' ')}</span>
                     <span>
                       {canProjectScenario
-                        ? projectedScenario.observed_at_ms === alert.triggered_at_ms
+                        ? isProjected
                           ? 'projected'
                           : 'focus chart'
                         : alert.is_acknowledged

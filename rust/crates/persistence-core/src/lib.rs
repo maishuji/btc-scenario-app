@@ -2,6 +2,16 @@ use market_data_core::candle::Candle;
 use market_data_core::snapshot::LivePriceSnapshot;
 use scenario_core::{FeatureSnapshot, MarketRegimeSnapshot, ScenarioSnapshot};
 
+pub fn scenario_snapshot_id(snapshot: &ScenarioSnapshot) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        snapshot.instrument_id,
+        snapshot.timeframe,
+        snapshot.observed_at.0,
+        "v1"
+    )
+}
+
 pub mod models {
     use market_data_core::timeframe::Timeframe;
 
@@ -928,13 +938,7 @@ pub mod sqlite {
         type Error = rusqlite::Error;
 
         fn save(&self, snapshot: &ScenarioSnapshot) -> Result<(), Self::Error> {
-            let identifier = format!(
-                "{}:{}:{}:{}",
-                snapshot.instrument_id,
-                snapshot.timeframe,
-                snapshot.observed_at.0,
-                "v1"
-            );
+            let identifier = super::scenario_snapshot_id(snapshot);
             self.connection.borrow().execute(
                 "INSERT OR REPLACE INTO scenario_snapshots (
                     id,

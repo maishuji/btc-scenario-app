@@ -43,6 +43,7 @@ mod api {
     use market_data_core::timeframe::Timeframe;
     use market_data_infrastructure::health::{SourceHealthMonitor, SourceStatus};
     use persistence_core::models::{AlertRecord, CandleRecord, LatestMarketOverviewRecord, ScenarioSnapshotRecord};
+    use persistence_core::scenario_snapshot_id;
     use persistence_core::queries::{
         AlertHistoryQuery,
         AlertHistoryQueryService,
@@ -83,6 +84,7 @@ mod api {
         pub instrument_id: String,
         pub timeframe: String,
         pub observed_at_ms: i64,
+        pub scenario_snapshot_id: String,
         pub last_price: f64,
         pub price_change_24h: f64,
         pub volume_24h: f64,
@@ -108,10 +110,13 @@ mod api {
 
     impl MarketOverviewResponse {
         pub fn from_record(record: LatestMarketOverviewRecord) -> Self {
+            let snapshot_id = scenario_snapshot_id(&record.scenario_snapshot);
+
             Self {
                 instrument_id: record.scenario_snapshot.instrument_id,
                 timeframe: record.scenario_snapshot.timeframe.as_str().to_owned(),
                 observed_at_ms: record.scenario_snapshot.observed_at.0,
+                scenario_snapshot_id: snapshot_id,
                 last_price: record.live_price_snapshot.last_price.0,
                 price_change_24h: record.live_price_snapshot.price_change_24h,
                 volume_24h: record.live_price_snapshot.volume_24h.0,
@@ -183,6 +188,7 @@ mod api {
         pub instrument_id: String,
         pub timeframe: String,
         pub observed_at_ms: i64,
+        pub scenario_snapshot_id: String,
         pub bull_probability: f64,
         pub base_probability: f64,
         pub bear_probability: f64,
@@ -194,10 +200,13 @@ mod api {
 
     impl ScenarioHistoryResponse {
         fn from_record(record: ScenarioSnapshotRecord) -> Self {
+            let snapshot_id = scenario_snapshot_id(&record.snapshot);
+
             Self {
                 instrument_id: record.snapshot.instrument_id,
                 timeframe: record.snapshot.timeframe.as_str().to_owned(),
                 observed_at_ms: record.snapshot.observed_at.0,
+                scenario_snapshot_id: snapshot_id,
                 bull_probability: record.snapshot.bull_probability,
                 base_probability: record.snapshot.base_probability,
                 bear_probability: record.snapshot.bear_probability,
@@ -217,6 +226,7 @@ mod api {
         pub severity: String,
         pub message: String,
         pub triggered_at_ms: i64,
+        pub scenario_snapshot_id: Option<String>,
         pub is_acknowledged: bool,
     }
 
@@ -229,6 +239,7 @@ mod api {
                 severity: record.severity,
                 message: record.message,
                 triggered_at_ms: record.triggered_at_ms,
+                scenario_snapshot_id: record.scenario_snapshot_id,
                 is_acknowledged: record.is_acknowledged,
             }
         }
@@ -471,6 +482,7 @@ mod tasks {
         ScenarioExplanationBuilder,
         ScenarioSnapshotFactory,
     };
+    use persistence_core::scenario_snapshot_id;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -669,7 +681,7 @@ mod tasks {
                         regime_label_as_str(current_regime.regime_label),
                     ),
                     triggered_at_ms: current_regime.observed_at.0,
-                    scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
+                    scenario_snapshot_id: Some(scenario_snapshot_id(current_scenario)),
                     is_acknowledged: false,
                 });
             }
@@ -688,7 +700,7 @@ mod tasks {
                         expected_direction_as_str(current_scenario.expected_direction),
                     ),
                     triggered_at_ms: current_scenario.observed_at.0,
-                    scenario_snapshot_id: Some(scenario_snapshot_identifier(current_scenario)),
+                    scenario_snapshot_id: Some(scenario_snapshot_id(current_scenario)),
                     is_acknowledged: false,
                 });
             }
@@ -755,16 +767,6 @@ mod tasks {
 
             Ok(persisted_analytics_count)
         }
-    }
-
-    fn scenario_snapshot_identifier(snapshot: &scenario_core::ScenarioSnapshot) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            snapshot.instrument_id,
-            snapshot.timeframe,
-            snapshot.observed_at.0,
-            "v1"
-        )
     }
 
     fn regime_change_severity(label: MarketRegimeLabel) -> &'static str {
@@ -1510,6 +1512,10 @@ mod tests {
 
         assert_eq!(response.0.instrument_id, "BTC-USD-SPOT");
         assert_eq!(response.0.timeframe, "1m");
+        assert_eq!(
+            response.0.scenario_snapshot_id,
+            "BTC-USD-SPOT:1m:1710000119999:v1"
+        );
         assert_eq!(response.0.last_price, 68_500.0);
         assert_eq!(response.0.support_level, 67_950.0);
         assert_eq!(response.0.resistance_level, 68_600.0);
@@ -1671,6 +1677,10 @@ mod tests {
 
         assert_eq!(response.0.len(), 2);
         assert_eq!(response.0[0].observed_at_ms, 1_710_000_060_000);
+        assert_eq!(
+            response.0[0].scenario_snapshot_id,
+            "BTC-USD-SPOT:1m:1710000060000:v1"
+        );
         assert_eq!(response.0[1].expected_direction, "bullish");
 
         let _ = std::fs::remove_file(db_path);
@@ -1686,11 +1696,30 @@ mod tests {
         let store = SqliteMarketDataStore::open(&db_path).expect("sqlite store should open");
         store.apply_migrations().expect("migrations should apply");
 
+        for observed_at in [1_710_000_060_000_i64, 1_710_000_120_000_i64] {
+            let scenario_snapshot = scenario_core::ScenarioSnapshot {
+                instrument_id: "BTC-USD-SPOT".to_owned(),
+                timeframe: market_data_core::timeframe::Timeframe::OneMinute,
+                observed_at: market_data_core::value_objects::Timestamp::new(observed_at).unwrap(),
+                bull_probability: 0.55,
+                base_probability: 0.30,
+                bear_probability: 0.15,
+                trigger_level: 150.0,
+                invalidation_level: 100.0,
+                expected_direction: scenario_core::ExpectedDirection::Bullish,
+                explanation: format!("BTC scenario at {observed_at}"),
+            };
+
+            ScenarioSnapshotRepository::save(&store, &scenario_snapshot)
+                .expect("scenario snapshot should save");
+        }
+
         let connection = Connection::open(&db_path).expect("sqlite connection should open");
-        for (id, triggered_at_ms, alert_type, severity, message, is_acknowledged) in [
+        for (id, triggered_at_ms, scenario_snapshot_id, alert_type, severity, message, is_acknowledged) in [
             (
                 "alert-1",
                 1_710_000_060_000_i64,
+                Some("BTC-USD-SPOT:1m:1710000060000:v1"),
                 "regime_changed",
                 "info",
                 "Regime changed to uptrend",
@@ -1699,6 +1728,7 @@ mod tests {
             (
                 "alert-2",
                 1_710_000_120_000_i64,
+                Some("BTC-USD-SPOT:1m:1710000120000:v1"),
                 "scenario_shifted",
                 "warning",
                 "Scenario shifted bullish",
@@ -1718,7 +1748,7 @@ mod tests {
                         scenario_snapshot_id,
                         is_acknowledged,
                         created_at_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         id,
                         "BTC-USD-SPOT",
@@ -1727,6 +1757,7 @@ mod tests {
                         severity,
                         message,
                         triggered_at_ms,
+                        scenario_snapshot_id,
                         is_acknowledged,
                         triggered_at_ms,
                     ],
@@ -1747,6 +1778,10 @@ mod tests {
         assert_eq!(response.0.len(), 2);
         assert_eq!(response.0[0].triggered_at_ms, 1_710_000_060_000);
         assert_eq!(response.0[0].alert_type, "regime_changed");
+        assert_eq!(
+            response.0[0].scenario_snapshot_id.as_deref(),
+            Some("BTC-USD-SPOT:1m:1710000060000:v1")
+        );
         assert_eq!(response.0[1].severity, "warning");
         assert!(response.0[1].is_acknowledged);
 
