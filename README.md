@@ -7,14 +7,13 @@ The repository now supports a single root development entrypoint.
 ### First-time setup
 
 ```bash
-npm install
-cd frontend && npm install
+make install
 ```
 
 ### Start the API and frontend together
 
 ```bash
-npm run dev
+make dev
 ```
 
 This starts:
@@ -28,6 +27,10 @@ The API now performs an initial Binance sync at startup and continues refreshing
 ### Useful root commands
 
 ```bash
-npm run build:frontend
-npm run test:rust
+make build
+make test
+make lint
+make fmt-check
 ```
+
+Run `make help` to see all available commands. The Makefile delegates to the existing npm and Cargo scripts.
